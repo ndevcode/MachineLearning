@@ -22,7 +22,7 @@ https://github.com/ndevcode/MachineLearning/nlayer.py
 user id : https://github.com/ndevcode/ndevcode
 
 This file  creates 2 classes, a n-layer network called NLayerNetwork and a handwriting number recognition system 
-class called MNISTHandwritingRecognizer that instantiates and uses the class. 
+class called MNISTHandwritingRecognizer that instantiates and uses the class. Includes support for dropout and regularization.
 
 This class uses python without the use of any library such as Tensorflow or Pytorch. 
 
