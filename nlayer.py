@@ -1,9 +1,8 @@
 # -*- coding: utf-8 -*-
 
 """
-   Copyright 2020-2021 N. Dev : github user id: ndevcode
-     
-
+   Copyright 2020-2021 N. Dev 
+   
    Licensed under the Apache License, Version 2.0 (the "License");
    you may not use this file except in compliance with the License.
    You may obtain a copy of the License at
@@ -20,6 +19,7 @@ Created on Tue Dec  8 08:41:53 2020
 
 @author: ndev
 https://github.com/ndevcode/MachineLearning/nlayer.py
+user id : https://github.com/ndevcode/ndevcode
 
 This file  creates 2 classes, a n-layer network called NLayerNetwork and a handwriting number recognition system 
 class called MNISTHandwritingRecognizer that instantiates and uses the class. 
