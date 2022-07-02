@@ -9,3 +9,8 @@ This class uses python without the use of any library such as Tensorflow or Pyto
 It has about 90% accuracy rate. 
 
 https://github.com/ndevcode/MachineLearning/blob/main/nlayer.py
+
+## CNN Based MNIST fashion classifier
+This file contains tensorflow code to classify clothing images as one of 10 categories. We experiment with changing layers and sizes of convolutions etc and document the results.
+
+https://github.com/ndevcode/MachineLearning/blob/main/cnnfashionmnist.ipynb
