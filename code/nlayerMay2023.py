@@ -18,6 +18,8 @@
    This program uses python and the numpy library to implement 
    forward and backward propagation in a neural network
    
+   With the tanh activation function we have approximately 92% train accuracy and 89.5% test accuracy
+   
    v1 : Created on Tue Dec  8 08:41:53 2020      
    v2 : Created on Thu May 11 09:31:41 2023
 
