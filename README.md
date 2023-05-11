@@ -3,7 +3,7 @@
 This repository contains code for my machine learning and deep learning projects
 
 ## N Layer Network
-The problem domain is to recognize digits in a handwriting recognition system using the MNIST dataset to train the neural network. This program uses python and the numpy library to implement forward and backward propagation in a neural network.
+The problem domain is to recognize digits in a handwriting recognition system using the MNIST dataset to train the neural network. This program uses python and the numpy library to implement forward and backward propagation in a neural network. With the tanh activation function we have approximately 92% train accuracy and 89.5% test accuracy. 
 
 https://github.com/ndevcode/MachineLearning/blob/main/code/nlayerMay2023.py
 
