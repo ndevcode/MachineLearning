@@ -3,10 +3,11 @@
 This repository contains code for my machine learning and deep learning projects
 
 ## N Layer Network
-This file  creates 2 classes, a n-layer network called NLayerNetwork and a handwriting number recognition system 
-class called MNISTHandwritingRecognizer that instantiates and uses the NLayerNetwork class. Includes support for dropout and regularization.
-This class uses python without the use of any library such as Tensorflow or Pytorch. 
-It has about 90% accuracy rate. 
+The problem domain is to recognize digits in a handwriting recognition system using the MNIST dataset to train the neural network. This program uses python and the numpy library to implement forward and backward propagation in a neural network.
+
+https://github.com/ndevcode/MachineLearning/blob/main/code/nlayerMay2023.py
+
+An older version of the code is also available at 
 
 https://github.com/ndevcode/MachineLearning/blob/main/code/nlayer.py
 
