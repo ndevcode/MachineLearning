@@ -18,21 +18,18 @@
    For this we use a neural network based system that we first train
    using the MNIST dataset.
    
-   The program is set up to do experiments by varying 
+   The program is set up to do make it easy to do experiments by varying 
     - learning rate
     - number of iterations
     - activation function
     - mini batch size
     - dropout, regularization
-   and generating graphical plots of training loss vs number of iterations 
-   for the experiments
+   and recording the output to generate graphical plots of training loss vs number 
+   of iterations for the experiments
    
    This program uses python and the numpy library to implement 
    forward and backward propagation in a neural network
    
-   v1 : Created on Tue Dec  8 08:41:53 2020      
-   v2 : Created on Thu May 11 09:31:41 2023
-
    We create 4 classes,
       HyperParameters            : encompasses all the hyperparameters for the learning process
       NLayerNetwork              : instantiates a configurable N layer fully connected neural network
@@ -100,6 +97,10 @@ class NLayerNetwork:
     def __init__(self,hyper_parameters,layers,x,y):
 
         self.init_hyperparameters(hyper_parameters)
+        
+        self.activation_functions = {}
+        self.activation_functions_derivatives = {}
+        self.init_activation_and_derivative_functions()
 
         self.L = len(layers)-1 #the last index 0,1,...,L
         self.layers = layers #L+1 layers including input and output
@@ -131,6 +132,26 @@ class NLayerNetwork:
         self.use_dropout = hyper_parameters.get_use_dropout()
         self.use_regularization = hyper_parameters.get_use_regularization()
         self.activation_scheme = hyper_parameters.get_activation_scheme()
+
+    def init_activation_and_derivative_functions(self):
+        def relu(x):
+            return (x>=0)*x
+        
+        def tanh(x):
+            return np.tanh(x)
+        
+        self.activation_functions["tanh"] = tanh
+        self.activation_functions["relu"] = relu
+
+        def relu2deriv(y):
+            return y>=0
+           
+        def tanh2deriv(y):
+            return 1 - (y ** 2)
+
+        self.activation_functions_derivatives["tanh"] = tanh2deriv
+        self.activation_functions_derivatives["relu"] = relu2deriv
+
         
     def create_mini_batches(self):
         mini_batches = []
@@ -143,28 +164,10 @@ class NLayerNetwork:
         return mini_batches
     
     def get_activation_fn(self,activation_scheme):
-        def relu(x):
-            return (x>=0)*x
-        
-        def tanh(x):
-            return np.tanh(x)
-        
-        if (activation_scheme == "tanh") :
-            return tanh
-        elif (activation_scheme == "relu") :
-            return relu
-        
+        return self.activation_functions[activation_scheme]
+
     def get_activation_fn_deriv(self,activation_scheme):
-        def relu2deriv(y):
-            return y>=0
-           
-        def tanh2deriv(y):
-            return 1 - (y ** 2)
-        
-        if (activation_scheme == "tanh") :
-            return tanh2deriv
-        elif (activation_scheme == "relu") :
-            return relu2deriv
+        return self.activation_functions_derivatives[activation_scheme]
 
     def softmax(self,x):
         temp = np.exp(x)
@@ -259,8 +262,8 @@ class NLayerNetwork:
             if ((i%10) == 9):
                 print("\r"+ \
                     " I:"+str(i)+ \
-                    " Error:" + str(y_cumulative_error/float(self.m))[0:5] +\
-                    " Correct:" + str(correct_count/float(self.m)))
+                    " Training error: " + str(y_cumulative_error/float(self.m))[0:5] +\
+                    " , Training Accuracy: " + str(correct_count/float(self.m)))
                 costs.append(y_cumulative_error/float(self.m))
                 iters.append(i)
         return costs,iters
@@ -277,8 +280,8 @@ class NLayerNetwork:
         for k in range(len(x)):
             correct_count += int(np.argmax(An[k:k+1]) == np.argmax(y[k:k+1]))
         print("\r"+ \
-            " Error:" + str(y_cumulative_error/float((len(x))))[0:5] +\
-            " Correct:" + str(correct_count/float(len(x))))  
+            " Test error: " + str(y_cumulative_error/float((len(x))))[0:5] +\
+            " , Test Accuracy: " + str(correct_count/float(len(x))))  
 
 class PreprocessData:
     def __init__(self):
