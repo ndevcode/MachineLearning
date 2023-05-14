@@ -18,15 +18,25 @@
    For this we use a neural network based system that we first train
    using the MNIST dataset.
    
+   The program is set up to do experiments by varying 
+    - learning rate
+    - number of iterations
+    - activation function
+    - mini batch size
+    - dropout, regularization
+   and generating graphical plots of training loss vs number of iterations 
+   for the experiments
+   
    This program uses python and the numpy library to implement 
    forward and backward propagation in a neural network
    
    v1 : Created on Tue Dec  8 08:41:53 2020      
    v2 : Created on Thu May 11 09:31:41 2023
 
-   We create 3 classes,
+   We create 4 classes,
       HyperParameters            : encompasses all the hyperparameters for the learning process
       NLayerNetwork              : instantiates a configurable N layer fully connected neural network
+      PreprocessData             : loads data and creates one hot labels
       MNistHandWritingRecognizer : top level class that instantiates the neural network and runs the neural network's train and test routines
    
 """
@@ -269,9 +279,9 @@ class NLayerNetwork:
         print("\r"+ \
             " Error:" + str(y_cumulative_error/float((len(x))))[0:5] +\
             " Correct:" + str(correct_count/float(len(x))))  
-               
-class MNISTHandwritingRecognizer:
-    def __init__(self,hyper_parameters):
+
+class PreprocessData:
+    def __init__(self):
         # Step 1 : load the MNIST data from local directory
         #for local usage and to use load_data functionality download the mnist data from
         #https://storage.googleapis.com/tensorflow/tf-keras-datasets/mnist.npz
@@ -296,8 +306,23 @@ class MNISTHandwritingRecognizer:
         # Step 3 : ditto for the test images
         self.test_images = self.x_test.reshape(len(self.x_test),28*28) / 255
         self.test_labels = self.make_one_hot_labels(self.y_test)
+
+    def make_one_hot_labels(self,labels):
+        num_cases = len(labels)
+        one_hot_labels = np.zeros((num_cases,10))
+        for i,l in enumerate(labels):
+            one_hot_labels[i][l] = 1
+        return one_hot_labels
         
-        # Step 4 : now create the layers
+    def get_train_data_and_labels(self):
+        return self.train_images, self.train_labels
+    
+    def get_test_data_and_labels(self):
+        return self.test_images, self.test_labels
+               
+class MNISTHandwritingRecognizer:
+    def __init__(self,hyper_parameters,theData):        
+        # Step 1 : create the layers of the neural network
         #number of neurons in input and output layers are fixed 
         #input : 784 = 28 * 28, the size of the image
         #output: 10, the 10 categories 0,1,..., 9
@@ -309,22 +334,20 @@ class MNISTHandwritingRecognizer:
             self.layers.append(num_neurons)
         self.layers.append(10)
         
-        # Step 5 : instantiate the neural network
+        # Step 2 : get the test and train images
+        self.train_images,self.train_labels = theData.get_train_data_and_labels()
+        self.test_images,self.test_labels = theData.get_test_data_and_labels()
+        
+        # Step 3 : instantiate the neural network
         self.nn = NLayerNetwork(hyper_parameters,self.layers,self.train_images,self.train_labels)
-    
-    def make_one_hot_labels(self,labels):
-        num_cases = len(labels)
-        one_hot_labels = np.zeros((num_cases,10))
-        for i,l in enumerate(labels):
-            one_hot_labels[i][l] = 1
-        return one_hot_labels
-    
+       
     def run(self):           
         costs,iters = self.nn.train()
         self.nn.test(self.test_images,self.test_labels)
         return costs,iters;
 
 if __name__ == "__main__":
+    theData = PreprocessData()
     #experiment 1 : use learning rate of 0.05
     experiment1 = HyperParameters(alpha = 0.05, 
                               num_iterations = 500,  
@@ -334,7 +357,7 @@ if __name__ == "__main__":
                               activation_scheme = "tanh",
                               use_dropout = True,
                               use_regularization = True) 
-    hwr = MNISTHandwritingRecognizer(experiment1)
+    hwr = MNISTHandwritingRecognizer(experiment1,theData)
     costs,iters = hwr.run()
     experiment1_plot, = plt.plot(iters,costs,color='red')
     experiment1_legend = "Learning rate = " + str(experiment1.get_learning_rate())
@@ -348,7 +371,7 @@ if __name__ == "__main__":
                               activation_scheme = "tanh",
                               use_dropout = True,
                               use_regularization = True) 
-    hwr = MNISTHandwritingRecognizer(experiment2)
+    hwr = MNISTHandwritingRecognizer(experiment2,theData)
     costs,iters = hwr.run()
     experiment2_plot, = plt.plot(iters,costs,color='blue')
     experiment2_legend = "Learning rate = " + str(experiment2.get_learning_rate())
