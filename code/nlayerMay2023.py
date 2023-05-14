@@ -12,13 +12,14 @@
    See the License for the specific language governing permissions and
    limitations under the License
 
-   The problem domain is to recognize digits in a handwriting recognition system
-   using the MNIST dataset to train the neural network
+   README
+   ------
+   The problem domain is to recognize digits in a handwriting recognition system.
+   For this we use a neural network based system that we first train
+   using the MNIST dataset.
    
    This program uses python and the numpy library to implement 
    forward and backward propagation in a neural network
-   
-   With the tanh activation function we have approximately 92% train accuracy and 89.5% test accuracy
    
    v1 : Created on Tue Dec  8 08:41:53 2020      
    v2 : Created on Thu May 11 09:31:41 2023
@@ -27,17 +28,17 @@
       HyperParameters            : encompasses all the hyperparameters for the learning process
       NLayerNetwork              : instantiates a configurable N layer fully connected neural network
       MNistHandWritingRecognizer : top level class that instantiates the neural network and runs the neural network's train and test routines
-   @author: ndevcode
+   
 """
 import math
 import numpy as np
 import matplotlib.pyplot as plt
 from keras.datasets import mnist #only needed for loading the MNIST dataset
-import os
+#import os
 
 class HyperParameters:
     def __init__(self,alpha,num_iterations,batch_size,
-                 lambd,hidden_layer_sizes,use_dropout,use_regularization):
+                 lambd,hidden_layer_sizes,use_dropout,use_regularization,activation_scheme):
         assert(alpha > 0.0)
         self.alpha = alpha #0.05 #learning rate
         
@@ -57,6 +58,9 @@ class HyperParameters:
         
         self.use_dropout = use_dropout
         self.use_regularization = use_regularization
+        
+        assert(activation_scheme == "tanh" or activation_scheme == "relu")
+        self.activation_scheme = activation_scheme
     
     def get_learning_rate(self):
         return self.alpha
@@ -78,6 +82,9 @@ class HyperParameters:
     
     def get_use_regularization(self):
         return self.use_regularization
+    
+    def get_activation_scheme(self):
+        return self.activation_scheme
 
 class NLayerNetwork:
     def __init__(self,hyper_parameters,layers,x,y):
@@ -113,6 +120,7 @@ class NLayerNetwork:
         self.lambd = hyper_parameters.get_regularization_lambda()#0.7 # for regularization
         self.use_dropout = hyper_parameters.get_use_dropout()
         self.use_regularization = hyper_parameters.get_use_regularization()
+        self.activation_scheme = hyper_parameters.get_activation_scheme()
         
     def create_mini_batches(self):
         mini_batches = []
@@ -123,19 +131,31 @@ class NLayerNetwork:
             mini_batch = (batch_start,batch_end)
             mini_batches.append(mini_batch)
         return mini_batches
+    
+    def get_activation_fn(self,activation_scheme):
+        def relu(x):
+            return (x>=0)*x
+        
+        def tanh(x):
+            return np.tanh(x)
+        
+        if (activation_scheme == "tanh") :
+            return tanh
+        elif (activation_scheme == "relu") :
+            return relu
+        
+    def get_activation_fn_deriv(self,activation_scheme):
+        def relu2deriv(y):
+            return y>=0
+           
+        def tanh2deriv(y):
+            return 1 - (y ** 2)
+        
+        if (activation_scheme == "tanh") :
+            return tanh2deriv
+        elif (activation_scheme == "relu") :
+            return relu2deriv
 
-    def relu(self,x):
-        return (x>=0)*x
-    
-    def relu2deriv(self,y):
-        return y>=0
-    
-    def tanh(self,x):
-        return np.tanh(x)
-    
-    def tanh2deriv(self,y):
-        return 1 - (y ** 2)
-    
     def softmax(self,x):
         temp = np.exp(x)
         return temp/np.sum(temp,axis=1,keepdims=True)
@@ -160,11 +180,13 @@ class NLayerNetwork:
         return cost_total
     
     def forward_propagation_inner(self,iData,use_dropout):
+        activation_fn = self.get_activation_fn(self.activation_scheme)
+        
         local_cache = {}
         local_cache["A0"] = iData
         for i in range(1,self.L):
             local_cache["Z"+str(i)] = np.dot(local_cache["A"+str(i-1)],self.weights["W"+str(i)].T)+self.weights["B"+str(i)].T
-            local_cache["A"+str(i)] = self.tanh(local_cache["Z"+str(i)])
+            local_cache["A"+str(i)] = activation_fn(local_cache["Z"+str(i)])
             if (use_dropout):
                 self.dropout[i] = np.random.randint(2,size=local_cache["A"+str(i)].shape)
                 local_cache["A"+str(i)] *= self.dropout[i] 
@@ -177,7 +199,8 @@ class NLayerNetwork:
         return self.cache["A"+str(self.L)]
         
     def backward_propagation(self,batch_start,batch_end,use_dropout,use_regularization):
- 
+        deriv_activation_fn = self.get_activation_fn_deriv(self.activation_scheme)
+        
         inner_m = batch_end - batch_start
         
         grads = {}
@@ -192,7 +215,7 @@ class NLayerNetwork:
             grads["dA"+str(i)] = np.dot(grads["dZ"+str(i+1)],self.weights["W"+str(i+1)])
             if (use_dropout):
                 grads["dA"+str(i)] *= self.dropout[i]
-            grads["dZ"+str(i)] = np.multiply(grads["dA"+str(i)],self.tanh2deriv(self.cache["A"+str(i)]))
+            grads["dZ"+str(i)] = np.multiply(grads["dA"+str(i)],deriv_activation_fn(self.cache["A"+str(i)]))
             grads["dW"+str(i)] = 1./inner_m * np.dot(grads["dZ"+str(i)].T,self.cache["A"+str(i-1)])
             if (use_regularization):
                 grads["dW"+str(i)] += (1./inner_m * (self.lambd * self.weights["W"+str(i)]))
@@ -252,7 +275,7 @@ class MNISTHandwritingRecognizer:
         # Step 1 : load the MNIST data from local directory
         #for local usage and to use load_data functionality download the mnist data from
         #https://storage.googleapis.com/tensorflow/tf-keras-datasets/mnist.npz
-        current_dir = os.getcwd()
+        #current_dir = os.getcwd()
         #(self.x_train, self.y_train), (self.x_test, self.y_test) = mnist.load_data(path=current_dir+'/mnist/mnist.npz')
         (self.x_train, self.y_train), (self.x_test, self.y_test) = mnist.load_data() # This works but may download data repeatedly
         
@@ -308,6 +331,7 @@ if __name__ == "__main__":
                               batch_size = 128,  
                               lambd = 0.7,  
                               hidden_layer_sizes = [100],
+                              activation_scheme = "tanh",
                               use_dropout = True,
                               use_regularization = True) 
     hwr = MNISTHandwritingRecognizer(experiment1)
@@ -321,6 +345,7 @@ if __name__ == "__main__":
                               batch_size = 128,  
                               lambd = 0.7,  
                               hidden_layer_sizes = [100],
+                              activation_scheme = "tanh",
                               use_dropout = True,
                               use_regularization = True) 
     hwr = MNISTHandwritingRecognizer(experiment2)
