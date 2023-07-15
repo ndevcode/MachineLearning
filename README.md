@@ -11,6 +11,12 @@ An older version of the code is also available at
 
 https://github.com/ndevcode/MachineLearning/blob/main/code/nlayer.py
 
+## Forward and backward pass for a CNN using python and numpy
+
+Implement forward and backward pass through a CNN using nothing but python and numpy
+
+https://github.com/ndevcode/MachineLearning/blob/main/code/CNN_fwd_bck_pass.py
+
 ## CNN Based MNIST fashion classifier
 This file contains tensorflow code to classify clothing images in one of 10 categories. We experiment with changing layers  and document the results.
 
