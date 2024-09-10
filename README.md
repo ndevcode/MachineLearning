@@ -21,3 +21,6 @@ https://github.com/ndevcode/MachineLearning/blob/main/code/CNN_fwd_bck_pass.py
 This file contains tensorflow code to classify clothing images in one of 10 categories. We experiment with changing layers  and document the results.
 
 https://github.com/ndevcode/MachineLearning/blob/main/code/cnnfashionmnist.ipynb
+
+## Pytorch Example
+https://github.com/ndevcode/MachineLearning/blob/main/code/pytorchExample.py
