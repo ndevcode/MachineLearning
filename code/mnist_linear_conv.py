@@ -202,16 +202,17 @@ class MyConvModel(nn.Module):
   def __init__(self,output_size) : 
     super(MyConvModel,self).__init__()
     self.conv_layer1 = nn.Conv2d(in_channels=1, out_channels = 32, kernel_size = 3) #MNIST data is only 1 channel
+    # first 16 is batch size; second 1 is number of channels which is 1 for MNIST data; 
     # (16 X 1 X 28 X 28) -> (16 X 32 X 26 X 26)  Hout = floor((Hin + 2*p - f)/s + 1); Wout = floor((Win + 2*p - f)/s + 1)
     self.relu1 = nn.ReLU()
     self.max_pool1 = nn.MaxPool2d(kernel_size=2,stride=2)
     # (16 X 32 X 26 X 26) -> (16 X 32 X 13 X 13) Hout = floor((Hin + 2*p - f)/s + 1); Wout = floor((Win + 2*p - f)/2 + 1)
 
     self.conv_layer2 = nn.Conv2d(in_channels=32, out_channels = 16, kernel_size = 3)
-    # (16 X 32 X 13 X 13) -> (16 X 64 X 11 X 11)
+    # (16 X 32 X 13 X 13) -> (16 X 16 X 11 X 11)
     self.relu2 = nn.ReLU()
     self.max_pool2 = nn.MaxPool2d(kernel_size=2,stride=2)
-    # (16 X 64 X 11 X 11) -> (16 X 64 X 5 X 5)
+    # (16 X 16 X 11 X 11) -> (16 X 16 X 5 X 5)
 
     #after flattening  (16 X 400)
     self.fc1 = nn.Linear(400,65)
