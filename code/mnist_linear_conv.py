@@ -183,6 +183,40 @@ def validate(mls,x_train,y_train) :
    correct_count += 1 if np.all(y_hat_train[i] == y_train[i]) else 0
   return correct_count
 
+class MyLinearLayer(nn.Module):
+  def __init__(self,input_size,output_size):
+    super(MyLinearLayer,self).__init__()
+    self.input_size = input_size
+    self.output_size = output_size
+    self.weight = nn.Parameter(torch.Tensor(output_size,input_size))
+    self.bias = nn.Parameter(torch.Tensor(output_size))
+    self.reset_parameters()
+ 
+  def reset_parameters(self):
+    nn.init.kaiming_uniform_(self.weight,a=math.sqrt(5))
+    if self.bias is not None :
+      fan_in,_ = nn.init._calculate_fan_in_and_fan_out(self.weight)
+      bound = 1/math.sqrt(fan_in)
+      nn.init.uniform_(self.bias,-bound,bound)
+
+  def forward(self,x) :
+    return x.matmul(self.weight.t()) + self.bias
+
+class MyCustomLinearFCModel(nn.Module):
+  def __init__(self,input_size,hidden_states,output_size) :
+    super(MyCustomLinearFCModel, self).__init__()
+    self.conn_i_h1 = MyLinearLayer(input_size,hidden_states)
+    #(16 X 768) -> (16 X hidden_states)
+    self.conn_h1_o = MyLinearLayer(hidden_states,output_size)
+    #(16 X hidden_states) -> (16 X output_size) 
+
+  def forward(self,x):
+    out = self.conn_i_h1(x)
+    out = nn.functional.relu(out)
+    out = self.conn_h1_o(out)
+    #out = nn.functional.softmax(out) # required only with MyLoss and nn.MSELoss
+    return out
+
 class MyLinearFCModel(nn.Module):
   def __init__(self,input_size,hidden_states,output_size) :
     super(MyLinearFCModel, self).__init__()
@@ -303,5 +337,40 @@ def run_conv():
   print(model.state_dict())
   print(correct)
 
+class MyLinearLayer(nn.Module):
+  def __init__(self,input_size,output_size):
+    super(MyLinearLayer,self).__init__()
+    self.input_size = input_size
+    self.output_size = output_size
+    self.weight = nn.Parameter(torch.Tensor(output_size,input_size))
+    self.bias = nn.Parameter(torch.Tensor(output_size))
+    self.reset_parameters()
+ 
+  def reset_parameters(self):
+    nn.init.kaiming_uniform_(self.weight,a=math.sqrt(5))
+    if self.bias is not None :
+      fan_in,_ = nn.init._calculate_fan_in_and_fan_out(self.weight)
+      bound = 1/math.sqrt(fan_in)
+      nn.init.uniform_(self.bias,-bound,bound)
+
+  def forward(self,x) :
+    return x.matmul(self.weight.t()) + self.bias
+
+class MyCustomLinearFCModel(nn.Module):
+  def __init__(self,input_size,hidden_states,output_size) :
+    super(MyCustomLinearFCModel, self).__init__()
+    self.conn_i_h1 = MyLinearLayer(input_size,hidden_states)
+    #(16 X 768) -> (16 X hidden_states)
+    self.conn_h1_o = MyLinearLayer(hidden_states,output_size)
+    #(16 X hidden_states) -> (16 X output_size) 
+
+  def forward(self,x):
+    out = self.conn_i_h1(x)
+    out = nn.functional.relu(out)
+    out = self.conn_h1_o(out)
+    #out = nn.functional.softmax(out) # required only with MyLoss and nn.MSELoss
+    return out
+
 run_linear()
 run_conv()
+run_custom_linear()
