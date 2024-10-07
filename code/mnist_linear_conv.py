@@ -119,7 +119,7 @@ def load_data(num_examples):
 
     assert num_examples >= 1, "Use atleast one example"
     # Data generation process
-    path = 'D:/work/deep-learning/grokking/work/mnist/mnist.npz'
+    path = '/long/path/to/mnist.npz'
     with np.load(path,allow_pickle=True) as mnistData:
       x_train,y_train = mnistData['x_train'],mnistData['y_train']
       x_test,y_test = mnistData['x_train'],mnistData['y_train']
