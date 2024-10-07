@@ -24,3 +24,6 @@ https://github.com/ndevcode/MachineLearning/blob/main/code/cnnfashionmnist.ipynb
 
 ## Pytorch Example
 https://github.com/ndevcode/MachineLearning/blob/main/code/pytorchExample.py
+
+## MNIST digit classifier using Fully Connected NN and CNN using Pytorch
+https://github.com/ndevcode/MachineLearning/blob/main/code/mnist_linear_conv.py
