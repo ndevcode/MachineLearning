@@ -27,3 +27,6 @@ https://github.com/ndevcode/MachineLearning/blob/main/code/pytorchExample.py
 
 ## MNIST digit classifier in Pytorch using Fully Connected NN, Convolutional NN and Fully Connected NN with Custom weight and bias layers 
 https://github.com/ndevcode/MachineLearning/blob/main/code/mnist_linear_conv.py
+
+##Alexnet implementation in Pytorch
+https://github.com/ndevcode/MachineLearning/blob/main/code/alexnet.py
