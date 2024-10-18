@@ -30,3 +30,6 @@ https://github.com/ndevcode/MachineLearning/blob/main/code/mnist_linear_conv.py
 
 ## Alexnet implementation in Pytorch
 https://github.com/ndevcode/MachineLearning/blob/main/code/alexnet.py
+
+## Inception v1 implementation in Pytorch
+https://github.com/ndevcode/MachineLearning/blob/main/code/inceptionv1.py
