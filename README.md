@@ -28,3 +28,6 @@ https://github.com/ndevcode/MachineLearning/blob/main/code/alexnet.py
 
 ## Inception v1 implementation in Pytorch
 https://github.com/ndevcode/MachineLearning/blob/main/code/inceptionv1.py
+
+## Resnet 18 implementation in Pytorch
+https://github.com/ndevcode/MachineLearning/blob/main/code/resnet18.py
