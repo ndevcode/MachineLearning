@@ -31,3 +31,6 @@ https://github.com/ndevcode/MachineLearning/blob/main/code/inceptionv1.py
 
 ## Resnet 18 implementation in Pytorch
 https://github.com/ndevcode/MachineLearning/blob/main/code/resnet18.py
+
+## Simple GAN using shallow NNs using only python and numpy
+https://github.com/ndevcode/MachineLearning/blob/main/code/gan_numpyonly.py
