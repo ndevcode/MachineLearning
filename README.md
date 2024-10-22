@@ -2,7 +2,7 @@
 
 This repository contains code for my machine learning and deep learning projects
 
-## ** Tutorials **
+##  Tutorials 
 Sl No | Name | Statement | Link
 ----- | --------- | ------------- | -----------------
 1 | N layer network | The problem domain is to recognize digits in a handwriting recognition system using the MNIST dataset to train the neural network. This program uses python and the numpy library to implement forward and backward propagation in a neural network. With the tanh activation function we have approximately 92% train accuracy and 89.5% test accuracy. | https://github.com/ndevcode/MachineLearning/blob/main/code/nlayerMay2023.py
@@ -11,7 +11,7 @@ Sl No | Name | Statement | Link
 4 | Pytorch - II | MNIST digit classifier in Pytorch using Fully Connected NN, Convolutional NN and Fully Connected NN with Custom weight and bias layers. Also a generic ML System to run multiple experiments |  https://github.com/ndevcode/MachineLearning/blob/main/code/mnist_linear_conv.py
 5 | GAN | A tutorial on how to generate sine waves using python and numpy | https://github.com/ndevcode/MachineLearning/blob/main/code/gan_numpyonly.py
 
-## ** Vision/Convolutional Neural Networks **
+##  Vision/Convolutional Neural Networks 
 Sl No | Name | Statement | Link
 ----- | --------- | ------------- | -----------------
 1 | Alexnet | Alexnet implementation in Pytorch | https://github.com/ndevcode/MachineLearning/blob/main/code/alexnet.py
