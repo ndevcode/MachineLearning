@@ -356,6 +356,9 @@ def prepare_data(x_train,y_train,x_test,y_test):
     x_tensor = torch.as_tensor(x_train).float()                          # 1)
     y_tensor = torch.as_tensor(y_train).float()                          # 1)
     dataset = TensorDataset(x_tensor,y_tensor)
+    x_test_tensor = torch.as_tensor(x_test).float()
+    y_test_tensor = torch.as_tensor(y_test).float()
+    test_dataset = TensorDataset(x_test_tensor,y_test_tensor)
     ################################################################
     #step 2 : train and validation set split
     ################################################################
@@ -368,13 +371,9 @@ def prepare_data(x_train,y_train,x_test,y_test):
     
     train_loader = DataLoader(dataset=train_data,batch_size=16,shuffle=True)
     val_loader = DataLoader(dataset=val_data,batch_size=16)
+    test_loader = DataLoader(dataset=test_dataset,batch_size=16)
 
-    x_train_tensor = torch.as_tensor(x_test).float()
-    y_train_tensor = torch.as_tensor(y_test).float()
-    train_dataset = TensorDataset(x_train_tensor,y_train_tensor)
-    train_loader = DataLoader(dataset=train_dataset,batch_size=16)
-
-    return train_loader,val_loader,train_loader
+    return train_loader,val_loader,test_loader
 
 #7 : Validate the prediction
 def validate(mls,x_train,y_train) :
