@@ -18,4 +18,7 @@ Sl No | Name | Statement | Link
 2 | Inception | Inception v1 implementation in Pytorch | https://github.com/ndevcode/MachineLearning/blob/main/code/inceptionv1.py
 3 | Resnet | Resnet 18 implementation in Pytorch | https://github.com/ndevcode/MachineLearning/blob/main/code/resnet18.py
 
-
+## Generative Adversarial Networks
+Sl No | Name | Statement | Link
+----- | --------- | ------------- | -----------------
+1 | Generate MNIST samples | Generate MNIST samples using Deep Convolutional NN. Implemented in Pytorch | https://github.com/ndevcode/MachineLearning/blob/main/code/dgcan1.py
