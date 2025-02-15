@@ -321,7 +321,7 @@ def load_data(num_examples):
     path = 'D:/work/deep-learning/grokking/work/mnist/mnist.npz'
     with np.load(path,allow_pickle=True) as mnistData:
       x_train,y_train = mnistData['x_train'],mnistData['y_train']
-      x_test,y_test = mnistData['x_train'],mnistData['y_train']
+      x_test,y_test = mnistData['x_test'],mnistData['y_test']
 
     # Displaying the data that we generated (first 5 values)
     #print("X:", x[:5], "\n\nY:", y[:5])
