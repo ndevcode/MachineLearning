@@ -36,7 +36,7 @@ def clear_folder(folder_path):
         print(f'The folder {folder_path} does not exist.')
 
 constants = {
-  "CUDA" : False,
+  "CUDA" : True,
   "DATA_PATH" : "D:/work/deep-learning/educativePytorchIntro",
   "OUT_PATH" : "D:/work/deep-learning/educativePytorchIntro/output",
   "LOG_FILE" : os.path.join('D:/work/deep-learning/educativePytorchIntro/output','log.txt'),
@@ -56,6 +56,7 @@ constants = {
 
 constants["cuda"] = True if torch.cuda.is_available() else False
 clear_folder(constants["OUT_PATH"])
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 def set_seed(constants):
     np.random.seed(constants["seed"])
@@ -110,8 +111,10 @@ def weights_init(m):
         m.bias.data.fill_(0)
         
 G = Generator(constants=constants)
+G = G.to(device)
 G.apply(weights_init)
 x = torch.randn((1,100,28,28), dtype = torch.float)
+x = x.to(device)
 yhat = G(x)
 print(yhat.shape)
 
@@ -159,8 +162,10 @@ class Discriminator(nn.Module):
         return yhat.view(-1,1).squeeze(1)
 
 D = Discriminator(constants=constants)
+D = D.to(device)
 D.apply(weights_init)
 z = torch.randn((1,1,496,496), dtype = torch.float)
+z = z.to(device)
 yhat = D(z)
 print(yhat.shape)
 
@@ -178,7 +183,6 @@ assert dataset
 if __name__ == "__main__":
     dataloader = torch.utils.data.DataLoader(dataset, batch_size=constants["BATCH_SIZE"],
                                          shuffle=True, num_workers=0)
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 print("Reached here")
 for epoch in range(constants["EPOCH_NUM"]):
