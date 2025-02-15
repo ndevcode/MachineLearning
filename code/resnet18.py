@@ -133,7 +133,7 @@ class MLSystem():
             correct_predictions += predicted
             total_predictions += len(y_batch)
             self.callback.on_batch_end(batch_idx, logs={
-                'loss': mini_batch_loss / (batch_idx + 1),
+                'loss': mini_batch_loss / len(y_batch),
                 'accuracy': predicted / len(y_batch)
             })
 
@@ -247,9 +247,9 @@ def get_train_valid_loader(data_dir, batch_size, augment, random_seed=42, valid_
     validation_sampler = SubsetRandomSampler(validation_idx)
 
     train_loader = DataLoader(
-        validation_dataset, batch_size=batch_size, sampler=train_sampler)
+        train_dataset, batch_size=batch_size, sampler=train_sampler)
     validation_loader = DataLoader(
-        train_dataset, batch_size=batch_size, sampler=validation_sampler)
+        validation_dataset, batch_size=batch_size, sampler=validation_sampler)
 
     return train_loader, validation_loader
 
