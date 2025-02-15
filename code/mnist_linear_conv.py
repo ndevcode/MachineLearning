@@ -293,7 +293,7 @@ class EarlyStopping():
         self.best_loss = None
 
     def on_epoch_end(self, epoch, logs = None):
-        current_loss = logs['loss']
+        current_loss = logs['val_loss']
         if self.best_loss is None or current_loss < self.best_loss :
             self.best_loss = current_loss
             self.counter = 0
