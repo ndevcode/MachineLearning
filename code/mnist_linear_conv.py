@@ -12,9 +12,8 @@ import matplotlib.pyplot as plt
 #0 : Some utility functions
 def get_correct_count(y_hat_train,y_train) :
     y_hat_train = (y_hat_train > 0).astype(int)
-    correct_count = 0
-    for i,_ in enumerate(y_train) : 
-        correct_count += 1 if np.all(y_hat_train[i] == y_train[i]) else 0
+    correct_predictions = np.all(y_hat_train == y_train, axis=1)  
+    correct_count = np.sum(correct_predictions)  
     return correct_count
 
 #1. The ML system that runs training and prediction
@@ -113,26 +112,30 @@ class MLSystem():
     np.random.seed(seed)
 
   def train(self, n_epochs, seed=42) :
+    print("using : %s"%(self.device))
     self.set_seed(seed)
     for epoch in range(n_epochs) :
       self.callback.on_epoch_begin(epoch)
       self.total_epochs += 1
+
       #1. run mini batch
       avg_loss,running_loss,correct_predictions,total_predictions = self.run_mini_batch(validation=False)
       self.train_losses.append(avg_loss)
+
+      #2. run validation
+      with torch.no_grad() :
+        avg_val_loss,running_val_loss,correct_val_predictions,total_val_predictions = self.run_mini_batch(validation=True) # need to track validation loss ?
+        self.val_losses.append(avg_val_loss)
+
       logs = {
         'loss' : running_loss / len(self.train_loader),
-        'accuracy' : correct_predictions / total_predictions
+        'accuracy' : correct_predictions / total_predictions,
+        'val_loss' : running_val_loss / len(self.val_loader)
       }
       self.callback.on_epoch_end(self.save_checkpoint,epoch,logs)
       if self.early_stopping_callback and self.early_stopping_callback.on_epoch_end(epoch, logs) : 
          break
       print("Loss after epoch %d is %.6f"%(epoch,avg_loss))
-
-      #2. run validation
-      with torch.no_grad() :
-        avg_val_loss,_,_,_ = self.run_mini_batch(validation=True) # need to track validation loss ?
-        self.val_losses.append(avg_val_loss)
 
   def predict(self,x) :
     #0. set model in eval
@@ -318,7 +321,8 @@ def load_data(num_examples):
 
     assert num_examples >= 1, "Use atleast one example"
     # Data generation process
-    path = 'D:/work/deep-learning/grokking/work/mnist/mnist.npz'
+    #path = 'D:/work/deep-learning/grokking/work/mnist/mnist.npz'
+    path = '/home/ndev/ml/datasets/mnist.npz'
     with np.load(path,allow_pickle=True) as mnistData:
       x_train,y_train = mnistData['x_train'],mnistData['y_train']
       x_test,y_test = mnistData['x_test'],mnistData['y_test']
