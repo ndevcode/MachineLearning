@@ -52,7 +52,7 @@ class Calculus():
         return 1./(1. + np.exp(-x))
 
     def _make_relu_deriv(self,x):
-        return self._make_relu(x)
+        return (x > 0).astype(int)
 
     def _make_leaky_relu_deriv(self,x, k = 0.2):
         return np.where(x >= 0,1., k)
