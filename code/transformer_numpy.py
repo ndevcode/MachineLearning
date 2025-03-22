@@ -1,5 +1,9 @@
 import numpy as np
 
+def softmax(x, axis=-1):
+    e_x = np.exp(x - np.max(x, axis=axis, keepdims=True))
+    return e_x / np.sum(e_x, axis=axis, keepdims=True)
+
 class Encoder :
     def __init__(self, d_model=512, num_heads = 8):
         self.d_model = d_model
@@ -15,8 +19,7 @@ class Encoder :
         scores = np.matmul(Q,K.T) / np.sqrt(d_k)
         if mask is not None :
             scores = np.where(mask,float('-inf'),scores)
-        attention_weights = np.exp(scores - np.max(scores, axis = 1, keepdims = True))
-        attention_weights /= np.sum(attention_weights, axis= -1, keepdims=True)
+        attention_weights = softmax(scores)
         output = np.matmul(attention_weights, V)
         return output
 
@@ -57,8 +60,7 @@ class Decoder :
         mask = np.triu(np.ones(attention_scores.shape), k=1)
         attention_scores = np.where(mask, float('-inf'), attention_scores)
 
-        attention_weights = np.exp(attention_scores - np.max(attention_scores, axis=-1, keepdims=True))
-        attention_weights /= np.sum(attention_weights, axis=-1, keepdims=True)
+        attention_weights = softmax(attention_scores)
         attention_output = np.matmul(attention_weights, value)
         return attention_output
 
@@ -87,9 +89,25 @@ class Transformer:
     def __init__(self,d_model=512,num_heads=8,max_length=100):
         self.encoder = Encoder(d_model,num_heads)
         self.decoder = Decoder(d_model,num_heads)
+        self.positional_encoding = self.create_positional_encoding(max_length, d_model)
+
+    def create_positional_encoding(self,max_length,d_model):
+        pos = np.arange(max_length)[:,np.newaxis]
+        i = np.arange(d_model)[np.newaxis,:]
+        angle_rates = 1. / np.power(10000,(2*(i//2))/np.float32(d_model))
+        pos_encoding = pos * angle_rates
+        pos_encoding[:,0::2] = np.sin(pos_encoding[:,0::2])
+        pos_encoding[:,1::2] = np.cos(pos_encoding[:,1::2])
+        return pos_encoding
 
     def forward(self, encoder_input, decoder_input):
+        # add positional encoding
+        encoder_seq_length = encoder_input.shape[0]
+        encoder_input += self.positional_encoding[:encoder_seq_length]
         encoder_output = self.encoder.forward(encoder_input)
+        
+        decoder_seq_length = decoder_input.shape[0]
+        decoder_input += self.positional_encoding[:decoder_seq_length]
         decoder_output = self.decoder.forward(decoder_input, encoder_output)
         return decoder_output
 
