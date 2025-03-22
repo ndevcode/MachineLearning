@@ -66,7 +66,7 @@ class Decoder :
 
     def encoder_decoder_attention(self, decoder_query, encoder_keys, encoder_values):
         attention_scores = np.matmul(decoder_query, encoder_keys.T) / np.sqrt(decoder_query.shape[1])
-        attention_scores = np.exp(attention_scores) / np.sum(np.exp(attention_scores), axis = 1, keepdims=True)
+        attention_scores = softmax(attention_scores)
         attention_output = np.matmul(attention_scores, encoder_values)
         return attention_output
 
