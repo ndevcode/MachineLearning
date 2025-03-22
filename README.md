@@ -11,7 +11,7 @@ Sl No | Name | Statement | Link
 4 | GAN | A tutorial on how to generate sine waves using python and numpy | https://github.com/ndevcode/MachineLearning/blob/main/code/gan_numpyonly.py
 5 | Attention | What is attention. Implemented in Python and numpy | https://github.com/ndevcode/MachineLearning/blob/main/code/attention_explanation.py
 6 | Self attention | Queries, Keys, Values in Python and numpy | https://github.com/ndevcode/MachineLearning/blob/main/code/self_attention.py
-7 | Transformer | A transformer. Encoder with self attention. Decoder with masked self attention and encoder decoder attention. All in Python and numpy | https://github.com/ndevcode/MachineLearning/blob/main/code/transformer_numpy.py
+7 | Transformer | A transformer. Encoder with multi head self attention. Decoder with masked multi head self attention and encoder decoder attention. All in Python and numpy | https://github.com/ndevcode/MachineLearning/blob/main/code/transformer_numpy.py
 
 ##  Vision/Convolutional Neural Networks 
 Sl No | Name | Statement | Link
