@@ -20,6 +20,7 @@ Sl No | Name | Statement | Link
 2 | Inception | Inception v1 implementation in Pytorch | https://github.com/ndevcode/MachineLearning/blob/main/code/inceptionv1.py
 3 | Resnet | Resnet 18 implementation in Pytorch | https://github.com/ndevcode/MachineLearning/blob/main/code/resnet18.py
 4 | ViT | Vision Transformer Implementation in Pytorch | https://github.com/ndevcode/MachineLearning/blob/main/code/vision_transformer.py
+5 | YOLO | Object detection using CNNs using a simplified YOLO architecture | https://github.com/ndevcode/MachineLearning/blob/main/code/yolo_cnn.py
 
 ## Generative Adversarial Networks
 Sl No | Name | Statement | Link
