@@ -638,7 +638,66 @@ def train_yolo_on_voc():
     return runner, test_loader
 
 ########################################################################################################
-#  PART 6 run inference
+#  PART 6 non maximum suppression
+########################################################################################################
+def custom_nms(boxes, scores, iou_threshold=0.1):
+    """
+    boxes: tensor of shape [N, 4]
+    scores: tensor of shape [N]
+    returns indices of boxes to keep
+    """
+    x1 = boxes[:, 0]
+    y1 = boxes[:, 1]
+    x2 = boxes[:, 2]
+    y2 = boxes[:, 3]
+
+    areas = (x2 - x1 + 1) * (y2 - y1 + 1)
+    _, order = scores.sort(descending=True)
+
+    keep = []
+
+    while order.numel() > 0:
+        i = order[0]
+        keep.append(i.item())
+
+        if order.numel() == 1:
+            break
+
+        xx1 = torch.max(x1[i], x1[order[1:]])
+        yy1 = torch.max(y1[i], y1[order[1:]])
+        xx2 = torch.min(x2[i], x2[order[1:]])
+        yy2 = torch.min(y2[i], y2[order[1:]])
+
+        w = (xx2 - xx1 + 1).clamp(min=0)
+        h = (yy2 - yy1 + 1).clamp(min=0)
+        inter = w * h
+
+        iou = inter / (areas[i] + areas[order[1:]] - inter)
+        mask = iou <= iou_threshold
+        order = order[1:][mask]
+
+    return keep
+
+def nms_boxes_custom(boxes, iou_threshold=0.1, score_threshold=0.1):
+    if len(boxes) == 0:
+        return []
+
+    boxes_tensor = torch.tensor([box[:4] for box in boxes], dtype=torch.float32)
+    scores_tensor = torch.tensor([box[5] for box in boxes], dtype=torch.float32)
+
+    keep_mask = scores_tensor >= score_threshold
+    boxes_tensor = boxes_tensor[keep_mask]
+    scores_tensor = scores_tensor[keep_mask]
+    filtered_boxes = [boxes[i] for i in range(len(boxes)) if keep_mask[i]]
+
+    if len(filtered_boxes) == 0:
+        return []
+
+    keep_indices = custom_nms(boxes_tensor, scores_tensor, iou_threshold)
+    return [filtered_boxes[i] for i in keep_indices]
+
+########################################################################################################
+#  PART 7 run inference
 ########################################################################################################
 def load_model(model,checkpoint_path):
     if os.path.exists(checkpoint_path):
@@ -739,12 +798,13 @@ def run_inference(img_path, device = 'cuda', model_path = 'best_model.pth'):
     output = output[0].cpu()
     print("output shape:",output.shape)
     boxes = decode_yolo_output(output)
+    #filtered_boxes = nms_boxes_custom(boxes)
+    #draw_boxes(pil_image, filtered_boxes)
     draw_boxes(pil_image, boxes)
 
 ########################################################################################################
-#  PART 7 : Test the model
+#  PART 8 : Test the model
 ########################################################################################################
 if __name__ == "__main__":
-    train_yolo_on_voc()
+#     train_yolo_on_voc()
     run_inference("myimage.jpg")
-      
