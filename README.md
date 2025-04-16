@@ -19,7 +19,7 @@ Sl No | Name | Statement | Link
 1 | Alexnet | Alexnet implementation in Pytorch | https://github.com/ndevcode/MachineLearning/blob/main/code/alexnet.py
 2 | Inception | Inception v1 implementation in Pytorch | https://github.com/ndevcode/MachineLearning/blob/main/code/inceptionv1.py
 3 | Resnet | Resnet 18 implementation in Pytorch | https://github.com/ndevcode/MachineLearning/blob/main/code/resnet18.py
-4 | YOLO | Object detection using CNNs using a simplified YOLO architecture | https://github.com/ndevcode/MachineLearning/blob/main/code/yolo_cnn.py
+4 | YOLO | Object detection  using a simplified YOLO architecture in Pytorch | https://github.com/ndevcode/MachineLearning/blob/main/code/yolo_cnn.py
 
 ## Generative Adversarial Networks
 Sl No | Name | Statement | Link
