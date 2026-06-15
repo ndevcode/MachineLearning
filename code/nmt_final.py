@@ -8,17 +8,15 @@ Created on Sat Mar 22 21:57:29 2025
 import re
 import os
 import time
-import itertools
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Dataset,DataLoader,random_split
-import shutil
-import einops
-from sklearn.model_selection import train_test_split
 from collections import Counter
+from functools import reduce
+# NOTE: removed dead imports `shutil`, `einops`, `train_test_split` (never used).
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
@@ -26,57 +24,31 @@ device = 'cuda' if torch.cuda.is_available() else 'cpu'
 #  PART 0 : ML System utilities
 ########################################################################################################
 class MLSystem:
-    def __init__(self, model, optimizer, criterion, device, vocab_size, pad_id):
+    def __init__(self, model, optimizer, criterion, device):
         self.model = model.to(device)
         self.optimizer = optimizer
         self.criterion = criterion
         self.device = device
-        self.vocab_size = vocab_size
-        self.pad_token_id = pad_id
 
     def train_step(self, batch):
         self.model.train()
         self.optimizer.zero_grad()
-    
+        
         src = batch["from_english_tokens"].to(self.device)
+        #print(f"src : {src}")
         tgt_input = batch["to_spanish_tokens_input"].to(self.device)
         tgt_output = batch["to_spanish_tokens_output"].to(self.device)
-    
-        # Ensure tgt_input and tgt_output have the same length
-        max_len = max(tgt_input.shape[1], tgt_output.shape[1])
         
-        # Pad tgt_input and tgt_output to max_len
-        tgt_input = F.pad(tgt_input, (0, max_len - tgt_input.shape[1]), value=self.pad_token_id)
-        tgt_output = F.pad(tgt_output, (0, max_len - tgt_output.shape[1]), value=self.pad_token_id)
-        
-        # Add start token
-        start_token = torch.full((tgt_input.shape[0], 1), self.vocab_size - 1, device=self.device, dtype=torch.long)
-        tgt_input = torch.cat((start_token, tgt_input[:, :-1]), dim=1)
-    
         predictions = self.model(src, tgt_input)
         loss = self.criterion(predictions.view(-1, predictions.shape[-1]), tgt_output.view(-1))
         loss.backward()
+
+        # Add gradient clipping
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+
         self.optimizer.step()
         
         return loss.item()
-
-#     def train_step(self, batch):
-#         self.model.train()
-#         self.optimizer.zero_grad()
-#         
-#         src = batch["from_english_tokens"].to(self.device)
-#         tgt_input = batch["to_spanish_tokens_input"].to(self.device)
-#         tgt_output = batch["to_spanish_tokens_output"].to(self.device)
-# 
-#         start_token = torch.full((tgt_input.shape[0], 1), self.vocab_size - 1, device=self.device, dtype=torch.long)
-#         tgt_input = torch.cat((start_token, tgt_input[:, :-1]), dim=1)
-#         
-#         predictions = self.model(src, tgt_input)
-#         loss = self.criterion(predictions.view(-1, predictions.shape[-1]), tgt_output.view(-1))
-#         loss.backward()
-#         self.optimizer.step()
-#         
-#         return loss.item()
 
     def validate_step(self, batch):
         self.model.eval()
@@ -161,6 +133,16 @@ def load_data(file_path):
     to_spanish_lang = [pair[1] for pair in language_pairs] #Spanish
     return from_english_lang,to_spanish_lang
 
+def preprocess_text(text):
+    """Normalized and tokenize text"""
+    if isinstance(text,list):
+        text = " ".join(text)
+    text = text.lower()  # Convert to lowercase
+    text = re.sub(r"[^a-z .?!,¿]", "", text)  # Remove special characters except punctuations
+    text = re.sub(r"([.?!,¿])", r" \1 ", text)  # Space out punctuations
+    text = text.strip()  # Trim spaces
+    return "[START] " + text + " [END]"
+
 def build_vocab(sentences,max_vocab_size=5000):
     """Build vocabulary from text dataset"""
     word_freq = Counter()
@@ -201,38 +183,68 @@ def ingest_data_debug(path):
     #1 : Load the data
     from_english_lang,to_spanish_lang = load_data(path)
     num_lines = len(from_english_lang)
+    #print(f"Number of lines loaded: {num_lines}")
 
     #2 : preprocess the data
     #print("Preprocessing English sentences...")
     start_time_en = time.time()
     processed_english = []
     for i, text in enumerate(from_english_lang):
+        #if i % 1000 == 0:  # Print progress every 1000 sentences
+            #print(f"Processed {i}/{num_lines} English sentences")
         processed_english.append(preprocess_text_debug(text))
     from_english_lang = processed_english
     end_time_en = time.time()
+    #print(f"Time taken to preprocess English sentences: {end_time_en - start_time_en:.2f} seconds")
 
     #print("Preprocessing Spanish sentences...")
     start_time_es = time.time()
     processed_spanish = []
     for i, text in enumerate(to_spanish_lang):
+        #if i % 1000 == 0:  # Print progress every 1000 sentences
+            #print(f"Processed {i}/{num_lines} Spanish sentences")
         processed_spanish.append(preprocess_text_debug(text))
     to_spanish_lang = processed_spanish
     end_time_es = time.time()
+    #print(f"Time taken to preprocess Spanish sentences: {end_time_es - start_time_es:.2f} seconds")
 
     #3 : create vocabularies and tokenizers
     english_vocab = build_vocab(from_english_lang)
     spanish_vocab = build_vocab(to_spanish_lang)
-    #print(f"Spanish Vocabulary:")
-    #print(f"  '[START]': {spanish_vocab.get('[START]')}")
-    #print(f"  '[END]': {spanish_vocab.get('[END]')}")
-    #print(f"English Vocabulary:")
-    #print(f"  '[START]': {english_vocab.get('[START]')}")
-    #print(f"  '[END]': {english_vocab.get('[END]')}")
+    print(f"Spanish Vocabulary:")
+    print(f"  '¿': {spanish_vocab.get('¿')}")
+    print(f"  '[START]': {spanish_vocab.get('[START]')}")
+    print(f"  '[END]': {spanish_vocab.get('[END]')}")
+    print(f"English Vocabulary:")
+    print(f"  '[START]': {english_vocab.get('[START]')}")
+    print(f"  '[END]': {english_vocab.get('[END]')}")
     english_tokenizer = CustomTokenizer(english_vocab)
     spanish_tokenizer = CustomTokenizer(spanish_vocab)
 
     #4 : create data loaders
     train_loader,validation_loader = prepare_data(from_english_lang,to_spanish_lang,english_tokenizer,spanish_tokenizer)
+    return train_loader,validation_loader,english_vocab,spanish_vocab
+
+def ingest_data(path):
+    #1 : Load the data
+    from_english_lang,to_spanish_lang = load_data(path)
+
+    #2 : preprocess the data
+    from_english_lang = [preprocess_text(text) for text in from_english_lang]
+    to_spanish_lang = [preprocess_text(text) for text in to_spanish_lang]
+
+    #3 : create vocabularies and tokenizers
+    english_vocab = build_vocab(from_english_lang)
+    spanish_vocab = build_vocab(to_spanish_lang)
+    english_tokenizer = CustomTokenizer(english_vocab)
+    spanish_tokenizer = CustomTokenizer(spanish_vocab)
+
+    #4 : create data loaders 
+    train_loader,validation_loader = prepare_data(from_english_lang,to_spanish_lang,english_tokenizer,spanish_tokenizer)
+#     for batch in train_loader :
+#         print("From:", batch["from_english_tokens"].shape)
+#         print("Target Input:", batch["to_spanish_tokens_input"].shape)
+#         print("Target Output:", batch["to_spanish_tokens_output"].shape)
     return train_loader,validation_loader,english_vocab,spanish_vocab
 
 ########################################################################################################
@@ -241,7 +253,10 @@ def ingest_data_debug(path):
 class PositionalEncoding(nn.Module):
     def __init__(self,d_model,adjusted_seq_length=50):
         super(PositionalEncoding,self).__init__()
-        self.pe = self.create_positional_encoding(adjusted_seq_length,d_model)
+        # persistent=False: pe is deterministic, so keep it out of state_dict
+        # (existing checkpoints saved before this change still load), while still
+        # moving with the module under .to(device).
+        self.register_buffer("pe", self.create_positional_encoding(adjusted_seq_length, d_model), persistent=False)
 
     def create_positional_encoding(self, adjusted_seq_length, d_model) :
         pos = torch.arange(adjusted_seq_length).unsqueeze(1) #shape : (adjusted_seq_length,1)
@@ -253,9 +268,9 @@ class PositionalEncoding(nn.Module):
         pos_encoding[:,1::2] = torch.cos(pos_encoding.clone()[:,1::2])
         return pos_encoding.unsqueeze(0) # shape : (1, max_length, d_model)
 
-    def forward(self, x):
-        #print(f"self.pe shape: {self.pe.shape}, x shape: {x.shape}")
-        return x + self.pe[:,:x.shape[1],:].to(x.device)
+    def forward(self, x): # x : [batch, seq_len, d_model]
+        # pe is [1, max_len, d_model]; slice to seq_len and broadcast over the batch.
+        return x + self.pe[:, :x.shape[1], :]
 
 ########################################################################################################
 #  PART 3 : Common Transformer Blocks between Encoder and Decoder
@@ -272,22 +287,22 @@ class AttentionHead(nn.Module):
         self.WK = nn.Linear(d_model,d_head,bias=False) #key embedding layer
         self.WV = nn.Linear(d_model,d_head) #value embedding layer
         self.dropout = nn.Dropout(dropout)
+    def forward(self,H,Henc = None): # H : [batch, q_len, d_model], Henc : [batch, kv_len, d_model]
+        assert H.dim() == 3 and H.size(2) == self.d_model, f"expected [batch, seq, d_model], got {tuple(H.shape)}"
+        # H = softmax(Q.(K.T)/sqrt(d_head)) . V
+        Q = self.WQ(H)                                              # [batch, q_len, d_head]
+        K, V = (self.WK(Henc), self.WV(Henc)) if self.cross_attention else (self.WK(H), self.WV(H))  # [batch, kv_len, d_head]
 
-    def forward(self,H,Henc = None): #size of H = [batch_size X adjusted_seq_length X d_model]
-        batch_size = H.size(0); batch_length = H.size(1)
-        # H = softmax(Q.(K.T)/sqrt(d_model)) . V
-        Q = self.WQ(H) # size = [batch_size, adjusted_seq_length, d_model]
-        K, V = (self.WK(Henc), self.WV(Henc)) if self.cross_attention else (self.WK(H), self.WV(H))
-
-        #print(f"Q shape: {Q.shape}, K shape: {K.shape}, K^T shape: {K.transpose(2,1).shape}")
-        attention_score = Q @ K.transpose(2,1) * self.d_head ** -0.5
+        attention_score = Q @ K.transpose(2,1) * self.d_head ** -0.5  # [batch, q_len, kv_len]
         if self.mask:
-            mask = torch.tril(torch.ones(batch_length,batch_length)).long().to(device)
-            attention_score = attention_score.masked_fill(mask==0,value=float('-inf'))
+            # causal mask over the (query, key) time axes; broadcasts over batch.
+            q_len, kv_len = attention_score.shape[-2], attention_score.shape[-1]
+            mask = torch.tril(torch.ones(q_len, kv_len, device=H.device))
+            attention_score = attention_score.masked_fill(mask == 0, value=float('-inf'))
 
-        attention_score = torch.softmax(attention_score,dim = 2)
+        attention_score = torch.softmax(attention_score, dim=-1)      # softmax over the key axis
         attention_score = self.dropout(attention_score)
-        H_HA = attention_score @ V
+        H_HA = attention_score @ V                                    # [batch, q_len, d_head]
         return H_HA
 
 # 3.2 A common multi head attention class
@@ -298,7 +313,6 @@ class MultipleAttentionHead(nn.Module):
         self.MHA = nn.ModuleList([attention_head_class(dropout,d_model,d_head) for _ in range(num_heads)])
         self.WO = nn.Linear(d_model,d_model)
         self.dropout = nn.Dropout(dropout)
-
     def forward(self,H, Henc=None): #size of H = [batch_size X adjusted_seq_length X d_model]
         batch_size = H.size(0); batch_length = H.size(1)
         # compute attention for each head
@@ -326,7 +340,6 @@ class EncoderTransformerBlock(nn.Module):
         self.LN_MLP = nn.LayerNorm(d_model)
         self.MHA = EncoderMultipleAttentionHead(dropout,d_model,num_heads)
         self.MLP = nn.Sequential(nn.Linear(d_model,4*d_model),nn.ReLU(),nn.Dropout(dropout),nn.Linear(4*d_model,d_model))
-
     def forward(self,H): #size of H = [batch_size X adjusted_seq_length X d_model]
         #self attention encoder
         H = H + self.MHA(self.LN_MHA(H)) # size = [batch_size X adjusted_seq_length X d_model]
@@ -341,13 +354,9 @@ class EncoderTransformer(nn.Module):
         self.TR_blocks = nn.ModuleList([EncoderTransformerBlock(dropout,d_model,num_heads) for _ in range(num_blocks)])
         self.pos_enc = PositionalEncoding(d_model,adjusted_seq_length)
     def forward(self,batch_seq):
-        H = batch_seq.transpose(1,0) # size = [batch_size, adjusted_seq_length, d_model]
-        batch_size = H.size(0); batch_len = H.size(1)
-        #pos_enc = self.pos_enc(H).unsqueeze(dim=0) # size = [1, adjusted_seq_length, d_model]
+        H = batch_seq
         H = self.pos_enc(H) # size = [batch_size, adjusted_seq_length, d_model]
-        for TR_block in self.TR_blocks : 
-            H = TR_block(H)
-        H = H.permute(1,0,2) # size=[batch_length, batch_size, d_model]
+        H = reduce(lambda h, block : block(h), self.TR_blocks, H) # apply the tranformer blocks sequentially to H
         return H
 
 ########################################################################################################
@@ -362,7 +371,7 @@ class DecoderSelfAttentionMultipleAttentionHead(MultipleAttentionHead):
 # 5.2 Cross Attention Multiple Head Attention
 class CrossAttentionMultipleAttentionHead(MultipleAttentionHead):
     def __init__(self, dropout, d_model=512, num_heads=8):
-        super().__init__(dropout, lambda d, dm, dh: AttentionHead(d, dm, dh, mask=True, cross_attention=True), d_model, num_heads)
+        super().__init__(dropout, lambda d, dm, dh: AttentionHead(d, dm, dh, mask=False, cross_attention=True), d_model, num_heads)
 
 # 5.3 Decoder Tranformer Block
 class DecoderTransformerBlock(nn.Module):
@@ -377,9 +386,9 @@ class DecoderTransformerBlock(nn.Module):
 
     def forward(self,H,Henc): #size of H = [batch_size X adjusted_seq_length X d_model]
         #print(f"H shape: {H.shape}, Henc shape: {Henc.shape}")
-        seq_len = min(H.shape[0], Henc.shape[0])
-        Henc = Henc[:seq_len,:, :]
-        H = H[:seq_len, :, :]
+        #seq_len = min(H.shape[0], Henc.shape[0])
+        #Henc = Henc[:seq_len,:, :]
+        #H = H[:seq_len, :, :]
         #print(f"H shape: {H.shape}, Henc shape: {Henc.shape}")
         #masked self attention decoder
         H = H + self.SA_MHA(self.LN_MHA_H(H)) #size = [batch_size X adjusted_seq_length X d_model]
@@ -395,16 +404,16 @@ class DecoderTransformer(nn.Module):
         super().__init__()
         self.TR_blocks = nn.ModuleList([DecoderTransformerBlock(dropout,d_model,num_heads) for _ in range(num_blocks)])
         self.pos_enc = PositionalEncoding(d_model,adjusted_seq_length)
-
     def forward(self,batch_seq,h_enc_seq):
-        H = batch_seq.transpose(1,0) # size = [batch_size, adjusted_seq_length, d_model]
-        Henc = h_enc_seq.transpose(1,0) 
-        batch_size = H.size(0); batch_len = H.size(1)
+        H = batch_seq
+        Henc = h_enc_seq
+        #pos_enc = self.pos_enc(H).unsqueeze(dim=0) # size = [1, adjusted_seq_length, d_model]
         H = self.pos_enc(H) # size = [batch_size, adjusted_seq_length, d_model]
 
-        for TR_block in self.TR_blocks:
-            H = TR_block(H,Henc)
-        H = H.permute(1,0,2) # size=[batch_length, batch_size, d_model]
+        def apply_block(h, block) :
+            return block(h, Henc)
+
+        H = reduce(apply_block, self.TR_blocks, H) # apply the tranformer blocks sequentially to H
         return H
 
 ########################################################################################################
@@ -423,27 +432,28 @@ class ANN(nn.Module):
 class AttentionNet(nn.Module):
     def __init__(self, english_vocab_size, spanish_vocab_size, dropout, num_blocks, adjusted_seq_length=50, d_model=512, num_heads=8):
         super(AttentionNet,self).__init__()
-        self.vocab_size = 10001
         self.encoder_embedding = nn.Embedding(english_vocab_size, d_model)
         self.decoder_embedding = nn.Embedding(spanish_vocab_size, d_model)
         self.ann = ANN(dropout,num_blocks,adjusted_seq_length,d_model,num_heads)
         self.layer3 = nn.Linear(d_model, spanish_vocab_size)
 
-    def forward(self, sentence_in, sentence_out) :
-        h_enc_seq = self.encoder_embedding(sentence_in)
-        h_dec_seq = self.decoder_embedding(sentence_out)
-        h_seq = self.ann(h_enc_seq, h_dec_seq)
-        score_seq = self.layer3(h_seq)
+    def forward(self, sentence_in, sentence_out) : # both : [batch, seq_len]
+        assert sentence_in.dim() == 2 and sentence_out.dim() == 2, \
+            f"expected [batch, seq_len] token ids, got {tuple(sentence_in.shape)} / {tuple(sentence_out.shape)}"
+        h_enc_seq = self.encoder_embedding(sentence_in)   # [batch, src_len, d_model]
+        h_dec_seq = self.decoder_embedding(sentence_out)  # [batch, tgt_len, d_model]
+        h_seq = self.ann(h_enc_seq, h_dec_seq)            # [batch, tgt_len, d_model]
+        score_seq = self.layer3(h_seq)                    # [batch, tgt_len, vocab_size]
         return score_seq
 
 ########################################################################################################
 #  PART 7 : Run the training loop
 ########################################################################################################
-def train_transformer(model, train_loader, val_loader, vocab_size, spanish_vocab_pad_id, epochs=4, lr=0.0001,save_interval=1, save_dir="checkpoints"):
+def train_transformer(model, train_loader, val_loader, epochs=12, lr=0.01,save_interval=2, save_dir="checkpoints"):
     optimizer = optim.Adam(model.parameters(), lr=lr)
     criterion = nn.CrossEntropyLoss(ignore_index=0)  # Assuming 0 is padding index
     
-    ml_system = MLSystem(model, optimizer, criterion, device, vocab_size, spanish_vocab_pad_id)
+    ml_system = MLSystem(model, optimizer, criterion, device)
     logger = TrainingLogger()
     early_stopper = EarlyStopping(patience=5)
     os.makedirs(save_dir,exist_ok=True)
@@ -457,9 +467,9 @@ def train_transformer(model, train_loader, val_loader, vocab_size, spanish_vocab
             batch_loss = ml_system.train_step(batch)
             train_loss += batch_loss
             batch_time = time.time() - batch_start_time
-            if batch_idx % 10 == 0:
-                print(f"[Epoch {epoch}/{epochs}] Batch {batch_idx}/{len(train_loader)} | "
-                      f"Train Loss: {batch_loss:.4f} | Time: {batch_time:.2f}s")
+            #if batch_idx % 10 == 0:
+            #    print(f"[Epoch {epoch}/{epochs}] Batch {batch_idx}/{len(train_loader)} | "
+            #          f"Train Loss: {batch_loss:.4f} | Time: {batch_time:.2f}s")
 
         train_loss /= len(train_loader)
         
@@ -474,7 +484,7 @@ def train_transformer(model, train_loader, val_loader, vocab_size, spanish_vocab
 
         # Save model every few epochs
         if (epoch + 1) % save_interval == 0:
-            checkpoint_path = os.path.join(save_dir, f"model_epoch_512_{epoch + 1}.pth")
+            checkpoint_path = os.path.join(save_dir, f"model_epoch_{epoch + 1}.pth")
             torch.save({
                 'epoch': epoch + 1,
                 'model_class': model.__class__.__name__,
@@ -495,12 +505,11 @@ def train_transformer(model, train_loader, val_loader, vocab_size, spanish_vocab
 def run_transformer():
     path = '/home/ndev/ml/datasets/spa-eng/spa.txt'
     train_loader,validation_loader,english_vocab,spanish_vocab = ingest_data_debug(path)    
-    net = AttentionNet(len(english_vocab),len(spanish_vocab),dropout = 0.0, num_blocks = 2, adjusted_seq_length = 40, d_model = 128, num_heads = 16)
+    net = AttentionNet(len(english_vocab),len(spanish_vocab),dropout = 0.1, num_blocks = 2, adjusted_seq_length = 50, d_model = 128, num_heads = 16)
     print(net)
     display_num_param(net)
     net = net.to(device)
-    spanish_vocab_pad_id = spanish_vocab["<pad>"]
-    train_transformer(net, train_loader, validation_loader, len(spanish_vocab), spanish_vocab_pad_id)
+    train_transformer(net, train_loader, validation_loader)
 
 
 ########################################################################################################
@@ -546,9 +555,8 @@ def generate_translation_autoregressive(model, english_tokenizer, spanish_tokeni
     model.eval()
 
     # Tokenize input English text
-    src_tokens = english_tokenizer.text_to_tensor(english_text, max_length).to(device)
-    #print(f"source tokens are {src_tokens}")
-    spanish_id_to_word = {idx: word for word, idx in spanish_tokenizer.vocab.items()}
+    src_tokens = english_tokenizer.text_to_tensor(english_text, max_length).unsqueeze(0).to(device)
+    print(f"source tokens are {src_tokens}")
 
     # Get the index of the "[START]" token in the Spanish vocabulary
     start_token_index = spanish_tokenizer.vocab.get("[START]")
@@ -558,22 +566,18 @@ def generate_translation_autoregressive(model, english_tokenizer, spanish_tokeni
     # Initialize the target sequence with the "[START]" token
     tgt_tokens = torch.tensor([[start_token_index]], dtype=torch.long).to(device)
 
-    generated_tokens = []
     # Generate tokens autoregressively
     for _ in range(max_length):
         # Forward pass
         with torch.no_grad():
-            src_batch = src_tokens.unsqueeze(0)  # Add batch dimension
-            output = model(src_batch, tgt_tokens)  # Output shape: [tgt_len, batch_size, vocab_size]
+            output = model(src_tokens, tgt_tokens)  # Output shape: [batch_size, tgt_len, vocab_size]
 
-        # Get the logits of the last predicted token
-        next_token_logits = output[-1, 0, :]
-        #print(next_token_logits)
+        # Get the logits for the NEXT token = the last position of the (batch-0) sequence.
+        next_token_logits = output[0, -1, :]
 
         # Predict the next token
         predicted_token_index = torch.argmax(next_token_logits).item()
-        generated_tokens.append(predicted_token_index)
-        #print(f"predicted_token_index : {predicted_token_index}")
+        print(f"predicted_token_index : {predicted_token_index}")
 
         # Append the predicted token to the target sequence
         tgt_tokens = torch.cat((tgt_tokens, torch.tensor([[predicted_token_index]]).to(device)), dim=1)
@@ -590,11 +594,88 @@ def generate_translation_autoregressive(model, english_tokenizer, spanish_tokeni
 
     # Convert token IDs to words (excluding "[START]" and "[END]")
     id_to_word = {idx: word for word, idx in spanish_tokenizer.vocab.items()}
-    translated_words = [id_to_word.get(idx, "<unk>") for idx in generated_tokens]
+    translated_words = [id_to_word.get(idx, "<unk>") for idx in tgt_tokens[0, 1:]]
 
     # Filter out padding tokens
-    result = ' '.join([w for w in translated_words if w not in ["[pad]", "[END]", "[START]"]])
+    result = ' '.join([w for w in translated_words if w not in ["<pad>", "[END]", "[START]"]])
     return result
+
+def debug_translation(model, english_tokenizer, spanish_tokenizer, english_text, max_length=40):
+    model.eval()
+    
+    print(f"Input text: {english_text}")
+    
+    # Tokenize input
+    src_tokens = english_tokenizer.text_to_tensor(english_text, max_length).to(device)
+    print(f"Source tokens: {src_tokens}")
+    
+    # Get some token-to-word mappings to help debugging
+    english_id_to_word = {idx: word for word, idx in english_tokenizer.vocab.items()}
+    spanish_id_to_word = {idx: word for word, idx in spanish_tokenizer.vocab.items()}
+    
+    print("Source tokens as words:")
+    for token in src_tokens:
+        print(f"{token.item()} -> {english_id_to_word.get(token.item(), '<unknown>')}")
+    
+    # Create initial target input with padding tokens
+    #tgt_input = torch.full((1, 1), spanish_tokenizer.vocab["<pad>"], dtype=torch.long).to(device)
+    start_token_index = spanish_tokenizer.vocab.get("[START]")
+    if start_token_index is None:
+        raise ValueError("The '[START]' token is not in the Spanish vocabulary.")
+    tgt_input = torch.tensor([[start_token_index]], dtype=torch.long).to(device)
+    
+    # Generate translation token by token
+    generated_tokens = []
+    
+    for i in range(max_length - 1):
+        # Forward pass
+        with torch.no_grad():
+            # Ensure shapes are correct
+            src_batch = src_tokens.unsqueeze(0)  # Add batch dimension
+            print(f"Source tokens here : {src_batch}")
+            
+            # Print shapes for debugging
+            print(f"\nStep {i+1}")
+            print(f"Source shape: {src_batch.shape}, Target input shape: {tgt_input.shape}")
+            
+            # Model forward pass
+            try:
+                output = model(src_batch, tgt_input)
+                print(f"Output shape: {output.shape}")
+
+                # Get probabilities of the next token (last position of the batch-0 sequence)
+                probabilities = torch.softmax(output[0, -1, :], dim=-1)
+                
+                # Get next token prediction
+                #next_token_idx = output[i, 0, :].argmax().item()
+                next_token_idx = probabilities.argmax(dim=-1).item()
+                print(f"next_token_idx : {next_token_idx}")
+                generated_tokens.append(next_token_idx)
+                
+                spanish_id_to_word = {idx: word for word, idx in spanish_tokenizer.vocab.items()}
+                print(f"Predicted token {next_token_idx} -> {spanish_id_to_word.get(next_token_idx, '<unknown>')}")
+                print(f"Step {i+1}: Token {next_token_idx}, Word: {spanish_id_to_word.get(next_token_idx, '<unknown>')}")
+
+                # Check probability of [END] token
+                end_token_index = spanish_tokenizer.vocab.get("[END]")
+                if end_token_index is not None:
+                    end_token_prob = probabilities[end_token_index].item()
+                    print(f"Probability of [END] token: {end_token_prob:.4f}")
+                
+                # Add predicted token to input for next iteration
+                next_token = torch.tensor([[next_token_idx]]).to(device)
+                tgt_input = torch.cat([tgt_input, next_token], dim=1)
+                
+            except Exception as e:
+                print(f"Error during forward pass: {e}")
+                break
+    
+    # Convert tokens to words and show final translation
+    translated_words = [spanish_id_to_word.get(idx, "<unk>") for idx in generated_tokens]
+    translation = ' '.join([w for w in translated_words if w != "<pad>"])
+    
+    print(f"\nFinal translation: {translation}")
+    return translation
 
 def generate_predictions():
 #     sample_sentences = [
@@ -609,22 +690,22 @@ def generate_predictions():
         "The weather is nice today."
     ]
 
+
     path = '/home/ndev/ml/datasets/spa-eng/spa.txt'
     _,_,english_vocab,spanish_vocab = ingest_data_debug(path)    
 
-    #print(dict(itertools.islice(spanish_vocab.items(), 50)))
-    #print(f"\nID of 'tom' in Spanish vocabulary: {spanish_vocab.get('tom', 'Not found')}")
+    import itertools
+    print(dict(itertools.islice(spanish_vocab.items(), 50)))
+    print(f"\nID of 'tom' in Spanish vocabulary: {spanish_vocab.get('tom', 'Not found')}")
 
     english_tokenizer = CustomTokenizer(english_vocab)
     spanish_tokenizer = CustomTokenizer(spanish_vocab)
 
-    net = AttentionNet(len(english_vocab),len(spanish_vocab),dropout = 0.0, num_blocks = 2, adjusted_seq_length = 40, d_model = 128, num_heads = 16)
+    net = AttentionNet(len(english_vocab),len(spanish_vocab),dropout = 0.1, num_blocks = 2, adjusted_seq_length = 40, d_model = 128, num_heads = 16)
 
-    net = load_model(net,'/home/ndev/ml/mar18transformers/checkpoints/model_epoch_512_4.pth')
-    #print(net)
-    #display_num_param(net)
+    net = load_model(net,'/home/ndev/ml/mar18transformers/checkpoints/model_epoch_2.pth')
  
-    #check_model_weights(net,'/home/ndev/ml/mar18transformers/checkpoints/model_epoch_512_4.pth')
+    #check_model_weights(net,'/home/ndev/ml/mar18transformers/checkpoints/model_epoch_4.pth')
 
     net = net.to(device)
 
@@ -632,7 +713,7 @@ def generate_predictions():
     translations = []
     for sentence in sample_sentences:
         preprocessed_sentence = preprocess_text_debug(sentence)
-        translated = generate_translation_autoregressive(net, english_tokenizer, spanish_tokenizer, preprocessed_sentence)
+        translated = debug_translation(net, english_tokenizer, spanish_tokenizer, preprocessed_sentence)
         translations.append(translated)
         print(f"English: {sentence}")
         print(f"Spanish: {translated}\n")
@@ -642,3 +723,4 @@ def generate_predictions():
 if __name__ == "__main__":
     #run_transformer()
     generate_predictions()
+
