@@ -713,6 +713,7 @@ def generate_predictions():
     translations = []
     for sentence in sample_sentences:
         preprocessed_sentence = preprocess_text_debug(sentence)
+        #translated = debug_translation(net, english_tokenizer, spanish_tokenizer, preprocessed_sentence)
         translated = debug_translation(net, english_tokenizer, spanish_tokenizer, preprocessed_sentence)
         translations.append(translated)
         print(f"English: {sentence}")
@@ -723,4 +724,3 @@ def generate_predictions():
 if __name__ == "__main__":
     #run_transformer()
     generate_predictions()
-

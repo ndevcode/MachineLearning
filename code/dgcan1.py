@@ -6,6 +6,8 @@ Created on Thu Oct 24 22:57:29 2024
 """
 
 import os
+import argparse
+import logging
 import numpy as np
 import torch
 import torch.nn as nn
@@ -37,10 +39,12 @@ def clear_folder(folder_path):
 
 constants = {
   "CUDA" : True,
-  "DATA_PATH" : "D:/work/deep-learning/educativePytorchIntro",
-  "OUT_PATH" : "D:/work/deep-learning/educativePytorchIntro/output",
-  "LOG_FILE" : os.path.join('D:/work/deep-learning/educativePytorchIntro/output','log.txt'),
-  "CHECKPOINT_FILE" : os.path.join('D:/work/deep-learning/educativePytorchIntro/output','dcgan_checkpoint.pth'),
+  # Path constants below are placeholders; populated from the command line at run time
+  # (see parse_args / populate_paths). Defaults are local, relative directories.
+  "DATA_PATH" : "./data",
+  "OUT_PATH" : "./output",
+  "LOG_PATH" : os.path.join("./output", "log.txt"),
+  "CHECKPOINT_FILE" : os.path.join("./output", "dcgan_checkpoint.pth"),
   "BATCH_SIZE" : 128,
   "IMAGE_CHANNEL" : 1,
   "Z_DIM" :  100,
@@ -51,12 +55,31 @@ constants = {
   "REAL_LABEL" :  1,
   "FAKE_LABEL" :  0,
   "lr" :  2e-4,
-  "seed" : 42 
+  "seed" : 42
 }
 
 constants["cuda"] = True if torch.cuda.is_available() else False
-clear_folder(constants["OUT_PATH"])
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Train a DCGAN on MNIST.")
+    parser.add_argument("--data-path", default=constants["DATA_PATH"],
+                        help="directory the MNIST dataset is read from / downloaded to")
+    parser.add_argument("--out-path", default=constants["OUT_PATH"],
+                        help="directory for generated samples and the checkpoint")
+    parser.add_argument("--log-path", default=None,
+                        help="log file path (default: <out-path>/log.txt)")
+    return parser.parse_args()
+
+
+def populate_paths(table, data_path, out_path, log_path=None):
+    """Populate the path entries of the constants table from command-line options."""
+    table["DATA_PATH"] = data_path
+    table["OUT_PATH"] = out_path
+    table["LOG_PATH"] = log_path if log_path is not None else os.path.join(out_path, "log.txt")
+    table["CHECKPOINT_FILE"] = os.path.join(out_path, "dcgan_checkpoint.pth")
+    return table
 
 def set_seed(constants):
     np.random.seed(constants["seed"])
@@ -106,17 +129,13 @@ def weights_init(m):
     classname = m.__class__.__name__ 
     if classname.find('Conv') != -1:
         m.weight.data.normal_(0.0,0.02)
-    elif classname.find('Batchnorm') != -1:
+    elif classname.find('BatchNorm') != -1:
         m.weight.data.normal_(1.0,0.02)
         m.bias.data.fill_(0)
         
 G = Generator(constants=constants)
 G = G.to(device)
 G.apply(weights_init)
-x = torch.randn((1,100,28,28), dtype = torch.float)
-x = x.to(device)
-yhat = G(x)
-print(yhat.shape)
 
 class Discriminator(nn.Module):
     def __init__(self,constants):
@@ -164,69 +183,83 @@ class Discriminator(nn.Module):
 D = Discriminator(constants=constants)
 D = D.to(device)
 D.apply(weights_init)
-z = torch.randn((1,1,496,496), dtype = torch.float)
-z = z.to(device)
-yhat = D(z)
-print(yhat.shape)
 
 loss_function = nn.BCELoss()
 optimizerD = optim.Adam(D.parameters(), lr=constants["lr"], betas=(0.5, 0.999))
 optimizerG = optim.Adam(G.parameters(), lr=constants["lr"], betas=(0.5, 0.999))
 
-dataset = datasets.MNIST(root=constants["DATA_PATH"], download=True,
-                     transform=transforms.Compose([
-                     transforms.Resize(constants["X_DIM"]),
-                     transforms.ToTensor(),
-                     transforms.Normalize((0.5,), (0.5,))
-                     ]))
-assert dataset
 if __name__ == "__main__":
+    # Side effects (folder wipe, dataset download, training, checkpointing) run only
+    # when executed as a script -- never on import.
+    args = parse_args()
+    populate_paths(constants, args.data_path, args.out_path, args.log_path)
+
+    # Make sure the output directory exists, then configure logging to LOG_PATH.
+    os.makedirs(constants["OUT_PATH"], exist_ok=True)
+    os.makedirs(os.path.dirname(constants["LOG_PATH"]) or ".", exist_ok=True)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(message)s",
+        handlers=[logging.FileHandler(constants["LOG_PATH"]), logging.StreamHandler()],
+    )
+    logging.info("DATA_PATH=%s OUT_PATH=%s LOG_PATH=%s CHECKPOINT_FILE=%s",
+                 constants["DATA_PATH"], constants["OUT_PATH"],
+                 constants["LOG_PATH"], constants["CHECKPOINT_FILE"])
+
+    clear_folder(constants["OUT_PATH"])
+
+    dataset = datasets.MNIST(root=constants["DATA_PATH"], download=True,
+                         transform=transforms.Compose([
+                         transforms.Resize(constants["X_DIM"]),
+                         transforms.ToTensor(),
+                         transforms.Normalize((0.5,), (0.5,))
+                         ]))
+    assert dataset
     dataloader = torch.utils.data.DataLoader(dataset, batch_size=constants["BATCH_SIZE"],
                                          shuffle=True, num_workers=0)
 
-print("Reached here")
-for epoch in range(constants["EPOCH_NUM"]):
-    for i, data in enumerate(dataloader):
-        #print(data[0].shape)
-        x_real = data[0].to(device)
-        real_label = torch.full((x_real.size(0),), constants["REAL_LABEL"], device=device).float()
-        fake_label = torch.full((x_real.size(0),), constants["FAKE_LABEL"], device=device).float()
-        # Update D with real data
-        D.zero_grad()
-        y_real = D(x_real)
-        #print(y_real,real_label)
-        loss_D_real = loss_function(y_real, real_label)
-        loss_D_real.backward()
-        # Update D with fake data
-        z_noise = torch.randn(x_real.size(0), constants["Z_DIM"], 1, 1, device=device)
-        x_fake = G(z_noise)
-        y_fake = D(x_fake.detach())
-        loss_D_fake = loss_function(y_fake, fake_label)
-        loss_D_fake.backward()
-        optimizerD.step()
-        # Update G with fake data
-        G.zero_grad()
-        y_fake_r = D(x_fake)
-        loss_G = loss_function(y_fake_r, real_label)
-        loss_G.backward()
-        optimizerG.step()
-        if i % 100 == 0:
-            print('Epoch {} [{}/{}] loss_D_real: {:.4f} loss_D_fake:{:.4f} loss_G: {:.4f}'.format(
-                epoch, i, len(dataloader),
-                loss_D_real.mean().item(),
-                loss_D_fake.mean().item(),
-                loss_G.mean().item()
-            ))
+    for epoch in range(constants["EPOCH_NUM"]):
+        for i, data in enumerate(dataloader):
+            #print(data[0].shape)
+            x_real = data[0].to(device)
+            real_label = torch.full((x_real.size(0),), constants["REAL_LABEL"], device=device).float()
+            fake_label = torch.full((x_real.size(0),), constants["FAKE_LABEL"], device=device).float()
+            # Update D with real data
+            D.zero_grad()
+            y_real = D(x_real)
+            #print(y_real,real_label)
+            loss_D_real = loss_function(y_real, real_label)
+            loss_D_real.backward()
+            # Update D with fake data
+            z_noise = torch.randn(x_real.size(0), constants["Z_DIM"], 1, 1, device=device)
+            x_fake = G(z_noise)
+            y_fake = D(x_fake.detach())
+            loss_D_fake = loss_function(y_fake, fake_label)
+            loss_D_fake.backward()
+            optimizerD.step()
+            # Update G with fake data
+            G.zero_grad()
+            y_fake_r = D(x_fake)
+            loss_G = loss_function(y_fake_r, real_label)
+            loss_G.backward()
+            optimizerG.step()
+            if i % 100 == 0:
+                logging.info('Epoch {} [{}/{}] loss_D_real: {:.4f} loss_D_fake:{:.4f} loss_G: {:.4f}'.format(
+                    epoch, i, len(dataloader),
+                    loss_D_real.mean().item(),
+                    loss_D_fake.mean().item(),
+                    loss_G.mean().item()
+                ))
 
-torch.save({
-    'generator_state_dict': G.state_dict(),
-    'discriminator_state_dict': D.state_dict(),
-    'optimizer_G_state_dict': optimizerG.state_dict(),
-    'optimizer_D_state_dict': optimizerD.state_dict(),
-}, constants["CHECKPOINT_FILE"])
+    torch.save({
+        'generator_state_dict': G.state_dict(),
+        'discriminator_state_dict': D.state_dict(),
+        'optimizer_G_state_dict': optimizerG.state_dict(),
+        'optimizer_D_state_dict': optimizerD.state_dict(),
+    }, constants["CHECKPOINT_FILE"])
 
-#Generate an image
-viz_noise = torch.randn(constants["BATCH_SIZE"], constants["Z_DIM"], 1, 1, device=device).float()
-with torch.no_grad():
-    viz_sample = G(viz_noise)
-    utils.save_image(viz_sample, os.path.join(constants["OUT_PATH"],'fake_samples_{}.png'.format(epoch)), normalize=True)
+    #Generate an image
+    viz_noise = torch.randn(constants["BATCH_SIZE"], constants["Z_DIM"], 1, 1, device=device).float()
+    with torch.no_grad():
+        viz_sample = G(viz_noise)
+        utils.save_image(viz_sample, os.path.join(constants["OUT_PATH"],'fake_samples_{}.png'.format(epoch)), normalize=True)

@@ -513,6 +513,7 @@ def run_custom_linear() :
   print_plots()
 
 
-#run_linear()
-#run_conv()
-run_custom_linear()
+if __name__ == "__main__":
+    #run_linear()
+    #run_conv()
+    run_custom_linear()

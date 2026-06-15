@@ -287,9 +287,11 @@ class BasicBlock(nn.Module):
             nn.BatchNorm2d(num_features = c_out)
         )
 
+        # Projection shortcut: 1x1 conv (matching the block's stride) + BN, no activation.
+        # The shortcut must stay linear so it can be added to the residual branch.
         self.downsample_net = nn.Sequential(
-            nn.Conv2d(in_channels = c_in, out_channels = c_out, kernel_size = 1, stride = 2),
-            nn.ReLU()
+            nn.Conv2d(in_channels = c_in, out_channels = c_out, kernel_size = 1, stride = stride),
+            nn.BatchNorm2d(num_features = c_out)
         )
 
     def forward(self,x) :
@@ -317,7 +319,7 @@ class BottleneckBlock(nn.Module):
     def forward(self,x) :
         z = self.net(x)
         out = z + x
-        out = nn.ReLU(out)
+        out = nn.functional.relu(out)
         return out
 
 class ResNet18(nn.Module):
@@ -377,4 +379,5 @@ def run():
     correct = validate(mls, test_loader)
     print(correct)
 
-run()
+if __name__ == "__main__":
+    run()

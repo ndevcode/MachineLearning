@@ -164,7 +164,6 @@ class Generator():
         
         self.b1 -= self.parms.get_parm("step_size_G") * d_b1
         self.b1 = np.maximum(-self.parms.get_parm("weight_clip"), np.minimum(self.parms.get_parm("weight_clip"),self.b1))
-        delta *= self.calculus.get_derivative("relu")(self.x1)
 
 class Discriminator():
     def __init__(self,parms,calculus):

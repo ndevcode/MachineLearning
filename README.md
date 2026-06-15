@@ -29,5 +29,5 @@ Sl No | Name | Statement | Link
 ## Transformers 
 Sl No | Name | Statement | Link
 ------ | ----- | ------------------ | ---------------
-1 | English to Spanish translation | Transformer composed of Attention Head, Multiple Head Attention, Encoder, Decoder, Cross Attention with positional encoding | https://github.com/ndevcode/MachineLearning/blob/main/code/nmt_final.py
+1 | English to Spanish translation | Transformer composed of Attention Head, Multiple Head Attention, Encoder, Decoder, Cross Attention with positional encoding. Teacher-forced training with greedy autoregressive decoding. | https://github.com/ndevcode/MachineLearning/blob/main/code/nmt_final.py
 2 | ViT | Vision Transformer Implementation in Pytorch | https://github.com/ndevcode/MachineLearning/blob/main/code/vision_transformer.py

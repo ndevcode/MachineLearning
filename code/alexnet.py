@@ -350,4 +350,5 @@ def run():
     correct = validate(mls,test_loader)
     print(correct)
 
-run()
+if __name__ == "__main__":
+    run()
