@@ -1,18 +1,36 @@
+// Copyright 2026 N Dev (ndevcode)
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 #include "Module.h"
+#include "Parallel.h"
 
 #include <algorithm>
 #include <cmath>
 #include <fstream>
 #include <limits>
+#include <numeric>
 #include <stdexcept>
+#include <string>
 
 namespace ml {
 namespace {
 
 Values initialize(std::size_t in, std::size_t out, std::mt19937& rng) {
     if (!in || !out || out > Values().max_size() / in)
-        throw std::invalid_argument("invalid layer dimensions");
-    std::normal_distribution<float> normal(0, std::sqrt(2.f / in));
+        throw std::invalid_argument("Layer: cannot allocate " + std::to_string(out) + " x " +
+                                    std::to_string(in) + " weights");
+    std::normal_distribution<float> normal(0, std::sqrt(2.f / static_cast<float>(in)));
     Values weights(in*out);
     for (float& w : weights) w = normal(rng);
     return weights;
@@ -21,66 +39,78 @@ Values initialize(std::size_t in, std::size_t out, std::mt19937& rng) {
 // Read counts against the remaining bytes before allocating from file metadata.
 class Reader {
 public:
-    explicit Reader(const std::filesystem::path& path) : file(path, std::ios::binary | std::ios::ate) {
-        if (!file) throw std::runtime_error("cannot open checkpoint: " + path.string());
-        remaining = static_cast<std::uintmax_t>(file.tellg());
-        file.seekg(0);
+    explicit Reader(const std::filesystem::path& path)
+        : path_(path), file_(path, std::ios::binary | std::ios::ate) {
+        if (!file_) throw std::runtime_error("cannot open checkpoint: " + path.string());
+        remaining_ = static_cast<std::uintmax_t>(file_.tellg());
+        file_.seekg(0);
     }
 
     template<class T> std::vector<T> read(std::size_t n) {
-        if (n > remaining / sizeof(T)) throw std::runtime_error("truncated checkpoint");
+        if (n > remaining_ / sizeof(T))
+            throw std::runtime_error("truncated checkpoint " + path_.string() + ": " +
+                                     std::to_string(n*sizeof(T)) + " bytes needed, " +
+                                     std::to_string(remaining_) + " left");
         std::vector<T> v(n);
-        auto bytes = n*sizeof(T);
-        if (!file.read(reinterpret_cast<char*>(v.data()), bytes))
-            throw std::runtime_error("checkpoint read error");
-        remaining -= bytes;
+        const auto bytes = n*sizeof(T);
+        if (!file_.read(reinterpret_cast<char*>(v.data()), static_cast<std::streamsize>(bytes)))
+            throw std::runtime_error("checkpoint read error: " + path_.string());
+        remaining_ -= bytes;
         return v;
     }
     std::uint32_t count() { return read<std::uint32_t>(1)[0]; }
+
 private:
-    std::ifstream file;
-    std::uintmax_t remaining;
+    std::filesystem::path path_;
+    std::ifstream file_;
+    std::uintmax_t remaining_ = 0;
 };
 
-std::uint32_t file_count(std::uint64_t size) {
+std::uint32_t fileCount(std::uint64_t size) {
     if (size > std::numeric_limits<std::uint32_t>::max())
-        throw std::length_error("layer too large for checkpoint");
+        throw std::length_error("checkpoint count " + std::to_string(size) + " exceeds 32 bits");
     return static_cast<std::uint32_t>(size);
 }
 
 template<class T> void write(std::ostream& stream, const T* data, std::size_t size) {
-    stream.write(reinterpret_cast<const char*>(data), size*sizeof(T));
+    stream.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(size*sizeof(T)));
 }
 
 } // namespace
 
-void Module::zero_grad() { for (auto p : parameters()) p.zero_grad(); }
-void Module::step(float lr) { for (auto p : parameters()) p.step(lr); }
+void Module::zeroGrad() { for (auto p : parameters()) p.zeroGrad(); }
+void Module::step(float learningRate) { for (auto p : parameters()) p.step(learningRate); }
 
 Layer::Layer(ndp::ForkJoinPool& pool, std::size_t nin, std::size_t nout,
              Activation activation, std::mt19937& rng)
-    : W(pool, {nout, nin}, initialize(nin, nout, rng)), b(pool, {nout}, Values(nout)),
+    : weights_(pool, {nout, nin}, initialize(nin, nout, rng)), bias_(pool, {nout}, Values(nout)),
       activations_(nout, activation) {}
 
 Layer::Layer(BasicTensor weights, BasicTensor bias, std::vector<Activation> activations)
-    : W(std::move(weights)), b(std::move(bias)), activations_(std::move(activations)) {
-    if (W.shape().size() != 2 || b.shape() != Shape{W.shape()[0]} ||
-        activations_.size() != W.shape()[0] || &W.pool() != &b.pool())
-        throw std::invalid_argument("invalid layer parameters");
+    : weights_(std::move(weights)), bias_(std::move(bias)), activations_(std::move(activations)) {
+    const Shape& ws = weights_.shape();
+    if (ws.size() != 2 || bias_.shape() != Shape{ws[0]} || activations_.size() != ws[0])
+        throw std::invalid_argument("Layer: expected weights {out, in}, bias {out} and out "
+                                    "activations; got weights " + toString(ws) + ", bias " +
+                                    toString(bias_.shape()) + ", " +
+                                    std::to_string(activations_.size()) + " activations");
+    if (&weights_.pool() != &bias_.pool())
+        throw std::invalid_argument("Layer: weights and bias belong to different pools");
 }
 
 BasicTensor Layer::forward(const BasicTensor& x) const {
-    // Same math as (x.matmul(W.T()) + b).activate(activations_), without materializing Wᵀ
-    // and with one barrier per layer instead of four. AutogradTest checks the two agree.
-    return x.dense(W, b, activations_);
+    // Same math as (x.matmul(weights_.transpose()) + bias_).activate(activations_), without
+    // materializing Wᵀ and with one barrier per layer instead of four. AutogradTest checks
+    // the two agree.
+    return x.dense(weights_, bias_, activations_);
 }
 
 MLP::MLP(ndp::ForkJoinPool& pool, std::size_t nin, const Shape& widths,
          Activation output, std::uint32_t seed) {
-    if (widths.empty()) throw std::invalid_argument("MLP needs an output layer");
+    if (widths.empty()) throw std::invalid_argument("MLP: widths must name at least the output layer");
     std::mt19937 rng(seed);
     for (std::size_t i = 0; i < widths.size(); ++i) {
-        auto activation = i+1 == widths.size() ? output : Activation::ReLU;
+        const auto activation = i + 1 == widths.size() ? output : Activation::ReLU;
         layers_.emplace_back(pool, nin, widths[i], activation, rng);
         nin = widths[i];
     }
@@ -91,6 +121,7 @@ BasicTensor MLP::forward(const BasicTensor& x) const {
     for (const auto& layer : layers_) y = layer(y);
     return y;
 }
+
 std::vector<BasicTensor> MLP::parameters() const {
     std::vector<BasicTensor> params;
     for (const Layer& layer : layers_) {
@@ -98,6 +129,74 @@ std::vector<BasicTensor> MLP::parameters() const {
         params.push_back(layer.bias());
     }
     return params;
+}
+
+MLP MLP::replicate() const {
+    std::vector<Layer> copies;
+    for (const Layer& layer : layers_) {
+        const BasicTensor& w = layer.weights();
+        const BasicTensor& b = layer.bias();
+        copies.emplace_back(BasicTensor(w.pool(), w.shape(), w.value()),
+                            BasicTensor(b.pool(), b.shape(), b.value()), layer.activations());
+    }
+    return MLP(std::move(copies));
+}
+
+float MLP::backwardSharded(const BasicTensor& x, std::size_t shards, const ShardLoss& loss) {
+    const std::size_t inputs = layers_.front().weights().shape()[1];
+    if (!gradEnabled())
+        throw std::logic_error("backwardSharded: gradients are disabled by a NoGradGuard on this thread");
+    if (x.shape().size() != 2 || x.shape()[1] != inputs)
+        throw std::invalid_argument("backwardSharded: expected x {batch, " + std::to_string(inputs) +
+                                    "}; got " + toString(x.shape()));
+    if (shards == 0 || !loss)
+        throw std::invalid_argument("backwardSharded: needs a positive shard count and a loss");
+    const std::size_t rows = x.shape()[0];
+    shards = std::min(shards, rows);
+    ndp::ForkJoinPool& pool = x.pool();
+    std::vector<std::vector<Values>> shardGrads(shards);  // [shard][parameter]
+    std::vector<double> shardLosses(shards);
+
+    // Step 1: one task per thread, each running shards t, t + tasks, ... on its own replica,
+    // so tasks share nothing they write. While the pool is busy with these tasks, the
+    // operations inside a shard run serially; either way a shard's arithmetic does not
+    // depend on which thread runs it.
+    const auto tasks = static_cast<unsigned>(std::min<std::size_t>(pool.size(), shards));
+    detail::runTasks(pool, tasks, [&](unsigned task) {
+        MLP replica = replicate();
+        const auto replicaParams = replica.parameters();
+        for (std::size_t s = task; s < shards; s += tasks) {
+            const auto [first, end] =
+                detail::chunk(rows, static_cast<unsigned>(s), static_cast<unsigned>(shards));
+            const std::size_t count = end - first;
+            const auto begin = x.value().begin() + std::ptrdiff_t(first*inputs);
+            BasicTensor slice(pool, {count, inputs}, Values(begin, begin + std::ptrdiff_t(count*inputs)),
+                              Grad::None);
+            replica.zeroGrad();
+            const BasicTensor shardLoss = loss(replica(slice), first, count);
+            if (!shardLoss.shape().empty())
+                throw std::invalid_argument("backwardSharded: the loss must be a scalar; got shape " +
+                                            toString(shardLoss.shape()));
+            // Weighted by the shard's share of the batch, the shard losses sum to the batch mean.
+            const BasicTensor weighted = shardLoss * (static_cast<float>(count) / static_cast<float>(rows));
+            weighted.backward();
+            shardLosses[s] = weighted.value()[0];
+            for (const auto& p : replicaParams) shardGrads[s].push_back(p.grad());
+        }
+    });
+
+    // Step 2: each parameter element sums its shard gradients in shard order; one owner per element.
+    auto params = parameters();
+    for (std::size_t p = 0; p < params.size(); ++p) {
+        Values total(params[p].value().size());
+        detail::parallelFor(pool, total.size(), shards, [&](std::size_t i) {
+            float sum = 0;
+            for (std::size_t s = 0; s < shards; ++s) sum += shardGrads[s][p][i];
+            total[i] = sum;
+        });
+        params[p].accumulateGrad(total);
+    }
+    return static_cast<float>(std::accumulate(shardLosses.begin(), shardLosses.end(), 0.0));
 }
 
 void MLP::save(const std::filesystem::path& path) const {
@@ -110,30 +209,30 @@ void MLP::save(const std::filesystem::path& path) const {
         if (fs::create_directory(staging)) break;
     }
     try {
-        auto staged = staging / "model";
+        const auto staged = staging / "model";
         std::ofstream file;
         file.exceptions(std::ios::failbit | std::ios::badbit);
         file.open(staged, std::ios::binary);
-        auto write_count = [&](std::uint64_t n) {
-            auto count = file_count(n);
+        auto writeCount = [&](std::uint64_t n) {
+            const auto count = fileCount(n);
             write(file, &count, 1);
         };
-        write_count(layers_.size()+1);
-        write_count(layers_.size());
-        auto inputs = layers_.front().weights().shape()[1];
-        write_count(inputs);
-        for (const auto& layer : layers_) write_count(layer.bias().value().size());
-        std::vector<std::uint8_t> codes(inputs, 0); // Input neurons pass through.
+        writeCount(layers_.size() + 1);
+        writeCount(layers_.size());
+        const auto inputs = layers_.front().weights().shape()[1];
+        writeCount(inputs);
+        for (const auto& layer : layers_) writeCount(layer.bias().value().size());
+        std::vector<std::uint8_t> codes(inputs, 0);  // Input neurons pass through.
         for (const auto& layer : layers_)
             for (auto a : layer.activations()) codes.push_back(static_cast<std::uint8_t>(a));
         write(file, codes.data(), codes.size());
         for (const auto& layer : layers_) {
-            auto width = layer.weights().shape()[1];
+            const auto width = layer.weights().shape()[1];
             const auto& weights = layer.weights().value();
             const auto& bias = layer.bias().value();
-            write_count(weights.size() + bias.size());
+            writeCount(weights.size() + bias.size());
             for (std::size_t i = 0; i < bias.size(); ++i) {
-                write(file, weights.data()+i*width, width);
+                write(file, weights.data() + i*width, width);
                 write(file, &bias[i], 1);
             }
         }
@@ -149,35 +248,44 @@ void MLP::save(const std::filesystem::path& path) const {
 
 MLP MLP::load(ndp::ForkJoinPool& pool, const std::filesystem::path& path) {
     Reader reader(path);
-    auto count = reader.count(), connections = reader.count();
-    if (count < 2 || connections != count-1) throw std::runtime_error("invalid checkpoint topology");
-    auto widths = reader.read<std::uint32_t>(count);
+    const auto count = reader.count(), connections = reader.count();
+    if (count < 2 || connections != count - 1)
+        throw std::runtime_error("checkpoint " + path.string() + ": " + std::to_string(count) +
+                                 " layers and " + std::to_string(connections) +
+                                 " connections is not a chain");
+    const auto widths = reader.read<std::uint32_t>(count);
     std::vector<std::vector<Activation>> activations;
-    for (auto width : widths) {
-        if (!width) throw std::runtime_error("empty layer in checkpoint");
-        auto codes = reader.read<std::uint8_t>(width);
+    for (std::size_t layer = 0; layer < widths.size(); ++layer) {
+        if (!widths[layer])
+            throw std::runtime_error("checkpoint " + path.string() + ": layer " +
+                                     std::to_string(layer) + " is empty");
+        const auto codes = reader.read<std::uint8_t>(widths[layer]);
         std::vector<Activation> row;
         for (auto code : codes) {
             if (code > static_cast<unsigned>(Activation::Linear))
-                throw std::runtime_error("unknown checkpoint activation");
+                throw std::runtime_error("checkpoint " + path.string() + ": unknown activation code " +
+                                         std::to_string(code) + " in layer " + std::to_string(layer));
             row.push_back(static_cast<Activation>(code));
         }
         activations.push_back(std::move(row));
     }
     std::vector<Layer> layers;
     for (std::size_t i = 0; i < connections; ++i) {
-        std::size_t in = widths[i], out = widths[i+1];
-        auto n = reader.count();
-        if (n != (std::uint64_t(in)+1)*out) throw std::runtime_error("wrong checkpoint weight count");
-        auto packed = reader.read<float>(n);
+        const std::size_t in = widths[i], out = widths[i + 1];
+        const auto n = reader.count();
+        if (n != (std::uint64_t(in) + 1)*out)
+            throw std::runtime_error("checkpoint " + path.string() + ": connection " + std::to_string(i) +
+                                     " holds " + std::to_string(n) + " values; " + std::to_string(out) +
+                                     " x (" + std::to_string(in) + " + 1) expected");
+        const auto packed = reader.read<float>(n);
         Values weights(in*out), bias(out);
         for (std::size_t j = 0; j < out; ++j) {
-            auto start = packed.begin() + j*(in+1);
-            std::copy_n(start, in, weights.begin()+j*in);
-            bias[j] = start[in];
+            const auto start = packed.begin() + std::ptrdiff_t(j*(in + 1));
+            std::copy_n(start, in, weights.begin() + std::ptrdiff_t(j*in));
+            bias[j] = start[std::ptrdiff_t(in)];
         }
         layers.emplace_back(BasicTensor(pool, {out, in}, std::move(weights)),
-                            BasicTensor(pool, {out}, std::move(bias)), std::move(activations[i+1]));
+                            BasicTensor(pool, {out}, std::move(bias)), std::move(activations[i + 1]));
     }
     return MLP(std::move(layers));
 }

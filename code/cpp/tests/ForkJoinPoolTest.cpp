@@ -1,3 +1,17 @@
+// Copyright 2026 N Dev (ndevcode)
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 #ifdef NDEBUG
 #undef NDEBUG
 #endif
@@ -24,7 +38,7 @@ using ndp::ForkJoinPool;
 namespace detail = ml::detail;
 
 // Longer than the pool's default 2 ms spin, so idle threads are asleep on the futex.
-constexpr auto kIdle = std::chrono::milliseconds(10);
+constexpr auto IDLE_TIME = std::chrono::milliseconds(10);
 
 // Every task index runs exactly once per run(), and its plain (non-atomic) writes to
 // its own slot are visible to the caller when run() returns.
@@ -117,10 +131,10 @@ void testWakeAfterSleep() {
     ForkJoinPool pool(4);
     std::vector<int> hits(4, 0);
     for (int r = 1; r <= 20; ++r) {
-        std::this_thread::sleep_for(kIdle);
+        std::this_thread::sleep_for(IDLE_TIME);
         // Task 0 (the caller) is the slow one, so the caller must also sleep while waiting.
         pool.run([&](unsigned task, unsigned) {
-            if (task == 0 && r % 2) std::this_thread::sleep_for(kIdle);
+            if (task == 0 && r % 2) std::this_thread::sleep_for(IDLE_TIME);
             ++hits[task];
         });
         for (int hit : hits) assert(hit == r && "a task was lost or repeated after a sleep");
@@ -137,7 +151,7 @@ void testShutdown() {
     {
         ForkJoinPool sleeping(4);
         sleeping.run([](unsigned, unsigned) {});
-        std::this_thread::sleep_for(kIdle);
+        std::this_thread::sleep_for(IDLE_TIME);
     }
     { ForkJoinPool partial(4); partial.run(2u, [](unsigned, unsigned) {}); }  // workers 2, 3 never ran
     std::cout << "PASSED\n";
@@ -162,11 +176,11 @@ void testChunkPartition() {
     std::cout << "PASSED\n";
 }
 
-// taskCount() stays serial below kMinWorkPerTask and never exceeds the pool or max_tasks.
+// taskCount() stays serial below MIN_WORK_PER_TASK and never exceeds the pool or max_tasks.
 void testTaskCount() {
     std::cout << "testTaskCount... ";
     ForkJoinPool pool(8);
-    const auto grain = detail::kMinWorkPerTask;
+    const auto grain = detail::MIN_WORK_PER_TASK;
     assert(detail::taskCount(pool, 0, 100) == 1 && "no work runs serially");
     assert(detail::taskCount(pool, grain - 1, 100) == 1 && "work below one grain runs serially");
     assert(detail::taskCount(pool, 3*grain, 100) == 3 && "one task per grain of work");
@@ -184,7 +198,7 @@ void testParallelFor() {
     auto fill = [&](ForkJoinPool& pool, std::size_t work_per_item) {
         std::vector<float> out(n, -1.f);
         std::vector<unsigned char> writes(n, 0);
-        detail::parallel_for(pool, n, work_per_item, [&](std::size_t i) {
+        detail::parallelFor(pool, n, work_per_item, [&](std::size_t i) {
             ++writes[i];
             out[i] = static_cast<float>(i % 1000) * 0.5f;
         });
@@ -200,7 +214,7 @@ void testParallelFor() {
     four.run([&](unsigned task, unsigned) { if (task == 0) nested = fill(four, 64); });
     assert(nested == serial && "fallback inside a run changed the result");
     std::size_t calls = 0;
-    detail::parallel_for(four, 0, 1, [&](std::size_t) { ++calls; });
+    detail::parallelFor(four, 0, 1, [&](std::size_t) { ++calls; });
     assert(calls == 0 && "an empty range runs nothing");
     std::cout << "PASSED\n";
 }

@@ -1,3 +1,17 @@
+// Copyright 2026 N Dev (ndevcode)
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 #pragma once
 
 #include "base/ForkJoinPool.h"
@@ -10,13 +24,14 @@ namespace ml::detail {
 
 // Smallest amount of work (multiply-adds or element operations) worth one more
 // thread. Below it a dispatch costs more than the loop it splits.
-constexpr std::size_t kMinWorkPerTask = 1u << 14;
+constexpr std::size_t MIN_WORK_PER_TASK = 1u << 14;
 
-// Tasks worth running for total_work units spread over at most max_tasks owners.
-inline unsigned taskCount(const ndp::ForkJoinPool& pool, std::size_t total_work,
-                          std::size_t max_tasks) {
-    const std::size_t useful = std::max<std::size_t>(1, total_work / kMinWorkPerTask);
-    return static_cast<unsigned>(std::min({useful, max_tasks, std::size_t(pool.size())}));
+// Tasks worth running for totalWork units spread over at most maxTasks owners.
+inline unsigned taskCount(const ndp::ForkJoinPool& pool, std::size_t totalWork,
+                          std::size_t maxTasks) {
+    const std::size_t useful = std::max<std::size_t>(1, totalWork / MIN_WORK_PER_TASK);
+    return static_cast<unsigned>(
+        std::max<std::size_t>(1, std::min({useful, maxTasks, std::size_t(pool.size())})));
 }
 
 inline std::size_t saturatingProduct(std::size_t a, std::size_t b) {
@@ -39,15 +54,25 @@ void runTasks(ndp::ForkJoinPool& pool, unsigned tasks, Task task) {
     pool.run(tasks, [&](unsigned t, unsigned) { task(t); });
 }
 
+// run(begin, end) once per task over disjoint slices covering [0, count). For kernels
+// that set up per-slice state (scratch rows, a broadcast cursor) once, not per index.
+template<class Function>
+void parallelRanges(ndp::ForkJoinPool& pool, std::size_t count, std::size_t workPerItem,
+                    Function run) {
+    if (!count) return;
+    const unsigned tasks = taskCount(pool, saturatingProduct(count, workPerItem), count);
+    runTasks(pool, tasks, [&](unsigned t) {
+        const auto [begin, end] = chunk(count, t, tasks);
+        run(begin, end);
+    });
+}
+
 // run(i) for every i in [0, count). Each i must write only outputs that i owns: then no
 // lock is needed and the result is the same for every thread count.
 template<class Function>
-void parallel_for(ndp::ForkJoinPool& pool, std::size_t count, std::size_t work_per_item,
-                  Function run) {
-    if (!count) return;
-    const unsigned tasks = taskCount(pool, saturatingProduct(count, work_per_item), count);
-    runTasks(pool, tasks, [&](unsigned t) {
-        const auto [begin, end] = chunk(count, t, tasks);
+void parallelFor(ndp::ForkJoinPool& pool, std::size_t count, std::size_t workPerItem,
+                 Function run) {
+    parallelRanges(pool, count, workPerItem, [&](std::size_t begin, std::size_t end) {
         for (auto i = begin; i < end; ++i) run(i);
     });
 }
