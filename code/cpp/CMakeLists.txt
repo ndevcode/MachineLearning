@@ -1,0 +1,20 @@
+cmake_minimum_required(VERSION 3.16)
+project(cpu_autograd LANGUAGES CXX)
+
+find_package(Threads REQUIRED)
+add_library(cpu_autograd BasicTensor.cpp Module.cpp base/ThreadPool.cpp)
+target_compile_features(cpu_autograd PUBLIC cxx_std_17)
+target_include_directories(cpu_autograd PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(cpu_autograd PUBLIC Threads::Threads)
+
+add_executable(mnist mnist.cpp)
+target_link_libraries(mnist PRIVATE cpu_autograd)
+
+include(CTest)
+if(BUILD_TESTING)
+    foreach(test IN ITEMS ThreadPoolTest AutogradTest)
+        add_executable(${test} tests/${test}.cpp)
+        target_link_libraries(${test} PRIVATE cpu_autograd)
+        add_test(NAME ${test} COMMAND ${test})
+    endforeach()
+endif()
