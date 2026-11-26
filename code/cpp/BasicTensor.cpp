@@ -17,12 +17,13 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
+#include <cstdint>
 #include <numeric>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
-#include <unordered_set>
 #include <utility>
 
 namespace ml {
@@ -199,6 +200,52 @@ float dot(const float* a, const float* b, std::size_t n) {
     return lanes[0] + tail;
 }
 
+// dest[t] += sum over q = 0..count-1, in order, of coef[q] * rows[q*stride + t], for t < width.
+// The shared kernel of matmul forward, matmul dB, dense dW and dense dX.
+//
+// Each pass streams ROWS_PER_PASS input rows across the full width, so the accumulator is
+// loaded and stored once per 4 rows instead of once per row, and the hardware prefetcher
+// sees 4 contiguous streams. Every element still sums in q order from zero, so results are
+// bitwise identical to a row-at-a-time loop. Measured against two alternatives (i7-13650HX,
+// one thread; README): 32-column register blocks walk the rows in strided strips, and lost
+// up to 63% at batch 1 in an SSE2 build, where those rows are read from memory once.
+// 4 rows per pass beat 8, and beat the plain row-at-a-time loop by 15-40% at batch 64 and up.
+constexpr std::size_t ROWS_PER_PASS = 4;
+void accumulateRows(const float* coef, std::size_t count, const float* rows, std::size_t stride,
+                    std::size_t width, float* dest) {
+    thread_local Values accBuffer;
+    if (accBuffer.size() < width) accBuffer.resize(width);
+    float* acc = accBuffer.data();
+    std::fill(acc, acc + width, 0.f);
+    std::size_t q = 0;
+    for (; q + ROWS_PER_PASS <= count; q += ROWS_PER_PASS) {
+        const float* row[ROWS_PER_PASS];
+        float c[ROWS_PER_PASS];
+        for (std::size_t u = 0; u < ROWS_PER_PASS; ++u) {
+            row[u] = rows + (q + u)*stride;
+            c[u] = coef[q + u];
+        }
+        for (std::size_t t = 0; t < width; ++t) {
+            float a = acc[t];
+            for (std::size_t u = 0; u < ROWS_PER_PASS; ++u) a += c[u] * row[u][t];
+            acc[t] = a;
+        }
+    }
+    for (; q < count; ++q) {
+        const float c = coef[q];
+        const float* row = rows + q*stride;
+        for (std::size_t t = 0; t < width; ++t) acc[t] += c * row[t];
+    }
+    for (std::size_t t = 0; t < width; ++t) dest[t] += acc[t];
+}
+
+// Per-thread scratch for coefficient columns, reused across calls instead of allocated.
+float* scratch(std::size_t n) {
+    thread_local Values buffer;
+    if (buffer.size() < n) buffer.resize(n);
+    return buffer.data();
+}
+
 float sigmoidValue(float x) {
     const float e = std::exp(-std::abs(x));
     return x >= 0 ? 1 / (1 + e) : e / (1 + e);
@@ -226,6 +273,44 @@ void rowSegments(std::size_t begin, std::size_t end, std::size_t width, Visit vi
         visit(row, first, last);
         begin += last - first;
     }
+}
+
+// visit(i, j) for each i in [begin, end) of the row-major index space `dims`, in order,
+// where j = sum over axes of coordinate * strides[axis]. Like Broadcast::walk, it divides
+// once per range and then steps an odometer.
+template<class Visit>
+void walkStrided(const Shape& dims, const Shape& strides, std::size_t begin, std::size_t end,
+                 Visit visit) {
+    if (begin >= end) return;
+    const std::size_t rank = dims.size(), last = rank - 1;  // callers pass rank >= 1
+    std::vector<std::size_t> pos(rank);
+    std::size_t rest = begin, j = 0;
+    for (std::size_t axis = rank; axis-- > 0;) {
+        pos[axis] = rest % dims[axis];
+        rest /= dims[axis];
+        j += pos[axis] * strides[axis];
+    }
+    const std::size_t step = strides[last];
+    for (std::size_t i = begin; i < end;) {
+        const std::size_t run = std::min(end - i, dims[last] - pos[last]);
+        for (std::size_t t = 0; t < run; ++t) visit(i + t, j + t*step);
+        i += run;
+        j += run*step;
+        pos[last] += run;
+        for (std::size_t axis = last; axis > 0 && pos[axis] == dims[axis]; --axis) {
+            j = j - dims[axis]*strides[axis] + strides[axis - 1];
+            pos[axis] = 0;
+            ++pos[axis - 1];
+        }
+    }
+}
+
+// Overflow throws instead of passing inf on (where a zero gradient times inf becomes NaN).
+void requireFinite(const char* op, const Values& result, const Shape& shape) {
+    const auto bad = std::find_if(result.begin(), result.end(), [](float y) { return !std::isfinite(y); });
+    if (bad != result.end())
+        throw std::overflow_error(std::string(op) + ": element " + std::to_string(bad - result.begin()) +
+                                  " of shape " + toString(shape) + " overflows float");
 }
 
 std::string notDifferentiable(const char* op, const Shape& shape) {
@@ -256,6 +341,7 @@ struct BasicTensor::Node {
     std::vector<std::size_t> parentVersions;
     Backward backward;
     std::size_t version = 0;
+    std::uint64_t visitMark = 0;  // the last backward() pass that reached this node
 
     Node(ndp::ForkJoinPool& p, Shape s, Values v, Grad g)
         : pool(p), shape(std::move(s)), value(std::move(v)), requiresGrad(g == Grad::Required) {
@@ -266,7 +352,32 @@ struct BasicTensor::Node {
                                         std::to_string(value.size()));
         if (requiresGrad) grad.assign(value.size(), 0.f);
     }
+
+    // Releasing the last handle to a long chain would otherwise recurse once per node
+    // through ~shared_ptr and overflow the stack (300,000 nodes did, on an 8 MB stack).
+    // Parents this node solely owns are unlinked onto a worklist and freed one at a time.
+    ~Node() {
+        std::vector<Ptr> pending = std::move(parents);
+        while (!pending.empty()) {
+            Ptr parent = std::move(pending.back());
+            pending.pop_back();
+            // use_count() == 1: this is the last owner, so nothing can be reading its parents.
+            if (parent.use_count() == 1) {
+                for (Ptr& grandparent : parent->parents) pending.push_back(std::move(grandparent));
+                parent->parents.clear();
+            }
+        }
+    }
+    Node(const Node&) = delete;
+    Node& operator=(const Node&) = delete;
+    Node(Node&&) = delete;
+    Node& operator=(Node&&) = delete;
 };
+
+namespace {
+// Distinguishes backward() passes so a node can record "visited" without a hash set.
+std::atomic<std::uint64_t> backwardPasses{0};
+} // namespace
 
 BasicTensor::BasicTensor(ndp::ForkJoinPool& p, Shape s, Values v, Grad g)
     : node_(std::make_shared<Node>(p, std::move(s), std::move(v), g)) {}
@@ -382,8 +493,24 @@ BasicTensor BasicTensor::unary(Function f, Derivative derivative) const {
 }
 
 BasicTensor BasicTensor::pow(float p) const {
-    return unary([p](float x) { return std::pow(x, p); },
-                 [p](float x, float) { return p == 0 ? 0.f : p * std::pow(x, p - 1); });
+    if (!std::isfinite(p)) throw std::invalid_argument("pow: exponent must be finite, got " + std::to_string(p));
+    const Values& v = value();
+    const bool integral = std::trunc(p) == p;
+    // Outside the domain: NaN input, a negative base with a fractional exponent, or a pole
+    // at 0 for a negative exponent. With a gradient, also 0 < p < 1 at 0: infinite slope.
+    const bool slopeAtZero = p > 0 && p < 1 && gradEnabled() && requiresGrad();
+    const auto bad = std::find_if(v.begin(), v.end(), [&](float x) {
+        return std::isnan(x) || (x < 0 && !integral) || (x == 0 && (p < 0 || slopeAtZero));
+    });
+    if (bad != v.end())
+        throw std::domain_error("pow: element " + std::to_string(bad - v.begin()) + " of shape " +
+                                toString(shape()) + " is " + std::to_string(*bad) + ", where x^" +
+                                std::to_string(p) + (slopeAtZero && *bad == 0 ? " has an infinite slope"
+                                                                               : " is undefined"));
+    auto y = unary([p](float x) { return std::pow(x, p); },
+                   [p](float x, float) { return p == 0 ? 0.f : p * std::pow(x, p - 1); });
+    requireFinite("pow", y.value(), shape());
+    return y;
 }
 BasicTensor BasicTensor::log() const {
     const Values& v = value();
@@ -395,7 +522,9 @@ BasicTensor BasicTensor::log() const {
     return unary([](float x) { return std::log(x); }, [](float x, float) { return 1 / x; });
 }
 BasicTensor BasicTensor::exp() const {
-    return unary([](float x) { return std::exp(x); }, [](float, float y) { return y; });
+    auto result = unary([](float x) { return std::exp(x); }, [](float, float y) { return y; });
+    requireFinite("exp", result.value(), shape());
+    return result;
 }
 BasicTensor BasicTensor::relu() const {
     return unary([](float x) { return std::max(0.f, x); }, [](float x, float) { return float(x > 0); });
@@ -411,7 +540,7 @@ BasicTensor BasicTensor::activate(const std::vector<Activation>& columns) const 
                                     "; need one per element of the last axis");
     if (std::all_of(columns.begin(), columns.end(), [&](auto a) { return a == columns.front(); })) {
         switch (columns.front()) {
-            case Activation::Linear: return *this;
+            case Activation::Linear: return identity();  // never an alias of the input
             case Activation::ReLU: return relu();
             case Activation::Sigmoid: return sigmoid();
         }
@@ -456,17 +585,12 @@ BasicTensor BasicTensor::matmul(const BasicTensor& rhs) const {
     Values values(m*n);
     const float* A = value().data();
     const float* B = rhs.value().data();
-    // C[i, :] = sum_kk A[i, kk] B[kk, :]. Each task owns a slice of C and sweeps rows of B,
-    // so the inner loop is contiguous and vectorizes across columns, while every element
-    // still sums over kk in order.
+    // C[i, :] = sum_kk A[i, kk] B[kk, :]. Each task owns a slice of C and sweeps rows of B
+    // (contiguous, vectorized across columns, four rows of B per pass); every
+    // element still sums over kk in order.
     detail::parallelRanges(pool(), values.size(), k, [&](std::size_t begin, std::size_t end) {
         rowSegments(begin, end, n, [&](std::size_t i, std::size_t j0, std::size_t j1) {
-            float* c = values.data() + i*n;
-            for (std::size_t kk = 0; kk < k; ++kk) {
-                const float aik = A[i*k + kk];
-                const float* bRow = B + kk*n;
-                for (std::size_t j = j0; j < j1; ++j) c[j] += aik * bRow[j];
-            }
+            accumulateRows(A + i*k, k, B + j0, n, j1 - j0, values.data() + i*n + j0);
         });
     });
     return result(std::move(dims), std::move(values), {node_, rhs.node_}, [m, k, n](const Node& out) {
@@ -484,15 +608,10 @@ BasicTensor BasicTensor::matmul(const BasicTensor& rhs) const {
         // Step 2: dB[kk, :] += sum_i A[i, kk] dC[i, :], swept a contiguous row of dC at a time.
         if (right.requiresGrad)
             detail::parallelRanges(out.pool, k*n, m, [&](std::size_t begin, std::size_t end) {
-                std::vector<float> acc;
                 rowSegments(begin, end, n, [&](std::size_t kk, std::size_t j0, std::size_t j1) {
-                    acc.assign(j1 - j0, 0.f);
-                    for (std::size_t i = 0; i < m; ++i) {
-                        const float aik = left.value[i*k + kk];
-                        const float* dRow = dC + i*n;
-                        for (std::size_t j = j0; j < j1; ++j) acc[j - j0] += aik * dRow[j];
-                    }
-                    for (std::size_t j = j0; j < j1; ++j) right.grad[kk*n + j] += acc[j - j0];
+                    float* column = scratch(m);  // A[:, kk], gathered once per segment
+                    for (std::size_t i = 0; i < m; ++i) column[i] = left.value[i*k + kk];
+                    accumulateRows(column, m, dC + j0, n, j1 - j0, right.grad.data() + kk*n + j0);
                 });
             });
     });
@@ -515,13 +634,15 @@ BasicTensor BasicTensor::dense(const BasicTensor& weights, const BasicTensor& bi
 
     const std::size_t rows = xs.size() == 2 ? xs[0] : 1, in = ws[1], out = ws[0];
     Shape dims = xs.size() == 2 ? Shape{rows, out} : Shape{out};
-    Values y(rows*out);
+    Values y(elementCount(dims));
     const float* X = value().data();
     const float* W = weights.value().data();
     const float* B = bias.value().data();
 
     // Forward: y[r, j] = act_j(x[r, :] . W[j, :] + b[j]). Both rows are contiguous, and
-    // the task that owns flat index r*out + j is the only writer of y[r, j].
+    // the task that owns flat index r*out + j is the only writer of y[r, j]. (Computing four
+    // outputs per pass over x[r, :] measured no faster: x's row is already in L1, and at
+    // batch 1 streaming W dominates.)
     detail::parallelRanges(pool(), y.size(), in, [&](std::size_t begin, std::size_t end) {
         rowSegments(begin, end, out, [&](std::size_t r, std::size_t j0, std::size_t j1) {
             for (std::size_t j = j0; j < j1; ++j)
@@ -542,69 +663,74 @@ BasicTensor BasicTensor::dense(const BasicTensor& weights, const BasicTensor& bi
         };
         // Input data (Grad::None) gets no dX: for the first layer that is half the work.
         const bool needParams = w.requiresGrad || b.requiresGrad;
-        const std::size_t work = rows*out*in * (std::size_t(needParams) + std::size_t(x.requiresGrad));
-        const unsigned tasks = detail::taskCount(node.pool, work, std::max(out, rows)*in);
+        const std::size_t layerWork = detail::saturatingProduct(rows*out, in);
+        const std::size_t work = detail::saturatingProduct(
+            layerWork, std::size_t(needParams) + std::size_t(x.requiresGrad));
+        const unsigned tasks =
+            detail::taskCount(node.pool, work, detail::saturatingProduct(std::max(out, rows), in));
         // Each task owns one slice of W's out*in elements (dW, plus db[j] for the slice
         // holding column 0 of row j) and one slice of x's rows*in elements (dX). The
         // slices are disjoint, so the three products are written without a lock.
         detail::runTasks(node.pool, tasks, [&](unsigned t) {
-            std::vector<float> acc(in);
-
             // Step 1: dW[j, k] += sum_r dZ[r, j] x[r, k]; db[j] += sum_r dZ[r, j].
             const auto [wBegin, wEnd] = detail::chunk(out*in, t, tasks);
             if (needParams)
                 rowSegments(wBegin, wEnd, in, [&](std::size_t j, std::size_t k0, std::size_t k1) {
-                    std::fill(acc.begin(), acc.begin() + std::ptrdiff_t(k1 - k0), 0.f);
-                    float biasSum = 0;
-                    for (std::size_t r = 0; r < rows; ++r) {
-                        const float g = dz(r, j);
-                        if (w.requiresGrad) {
-                            const float* xr = x.value.data() + r*in;
-                            for (std::size_t k = k0; k < k1; ++k) acc[k - k0] += g * xr[k];
-                        }
-                        biasSum += g;
+                    if (!w.requiresGrad && k0 != 0) return;  // bias only: just the slice owning db[j]
+                    float* column = scratch(rows);           // dZ[:, j], computed once per slice
+                    for (std::size_t r = 0; r < rows; ++r) column[r] = dz(r, j);
+                    if (b.requiresGrad && k0 == 0) {
+                        float biasSum = 0;
+                        for (std::size_t r = 0; r < rows; ++r) biasSum += column[r];
+                        b.grad[j] += biasSum;
                     }
                     if (w.requiresGrad)
-                        for (std::size_t k = k0; k < k1; ++k) w.grad[j*in + k] += acc[k - k0];
-                    if (b.requiresGrad && k0 == 0) b.grad[j] += biasSum;
+                        accumulateRows(column, rows, x.value.data() + k0, in, k1 - k0,
+                                       w.grad.data() + j*in + k0);
                 });
 
             // Step 2: dX[r, k] += sum_j dZ[r, j] W[j, k].
             const auto [xBegin, xEnd] = detail::chunk(rows*in, t, tasks);
             if (x.requiresGrad)
                 rowSegments(xBegin, xEnd, in, [&](std::size_t r, std::size_t k0, std::size_t k1) {
-                    std::fill(acc.begin(), acc.begin() + std::ptrdiff_t(k1 - k0), 0.f);
-                    for (std::size_t j = 0; j < out; ++j) {
-                        const float g = dz(r, j);
-                        const float* wj = w.value.data() + j*in;
-                        for (std::size_t k = k0; k < k1; ++k) acc[k - k0] += g * wj[k];
-                    }
-                    for (std::size_t k = k0; k < k1; ++k) x.grad[r*in + k] += acc[k - k0];
+                    float* row = scratch(out);  // dZ[r, :], computed once per slice
+                    for (std::size_t j = 0; j < out; ++j) row[j] = dz(r, j);
+                    accumulateRows(row, out, w.value.data() + k0, in, k1 - k0, x.grad.data() + r*in + k0);
                 });
         });
     });
 }
 
+BasicTensor BasicTensor::identity() const {
+    return unary([](float x) { return x; }, [](float, float) { return 1.f; });
+}
+
 BasicTensor BasicTensor::transpose() const {
-    if (shape().size() < 2) return *this;
-    Shape dims(shape().rbegin(), shape().rend());
-    auto transposeIndex = [s = shape()](std::size_t i) {
-        if (s.size() == 2) return (i % s[1]) * s[0] + i / s[1];
-        std::size_t dest = 0;
-        for (auto it = s.rbegin(); it != s.rend(); ++it) {
-            dest = dest * *it + i % *it;
-            i /= *it;
-        }
-        return dest;
-    };
+    // A new node even when nothing moves, so the result never aliases its input's gradient.
+    if (shape().size() < 2) return identity();
+    const Shape& s = shape();
+    const std::size_t rank = s.size();
+    Shape dims(s.rbegin(), s.rend());
+    // Input axis a becomes output axis rank-1-a. Row-major strides of both layouts:
+    // inStrides[a] = product of s[a+1..], outStrides[a] = product of s[..a-1] (the stride
+    // of output axis rank-1-a).
+    Shape inStrides(rank), outStrides(rank);
+    for (std::size_t a = rank, stride = 1; a-- > 0;) { inStrides[a] = stride; stride *= s[a]; }
+    for (std::size_t a = 0, stride = 1; a < rank; ++a) { outStrides[a] = stride; stride *= s[a]; }
+    // Forward gathers: walk the output in order, reading input axis rank-1-q for output axis q.
+    const Shape gather(inStrides.rbegin(), inStrides.rend());
     Values values(value().size());
-    detail::parallelFor(pool(), values.size(), 1, [&](std::size_t i) {
-        values[transposeIndex(i)] = value()[i];
+    const float* x = value().data();
+    detail::parallelRanges(pool(), values.size(), 1, [&](std::size_t begin, std::size_t end) {
+        walkStrided(dims, gather, begin, end, [&](std::size_t o, std::size_t i) { values[o] = x[i]; });
     });
-    return result(std::move(dims), std::move(values), {node_}, [transposeIndex](const Node& out) {
+    return result(std::move(dims), std::move(values), {node_}, [s, outStrides](const Node& out) {
         Node& in = *out.parents[0];
-        detail::parallelFor(out.pool, in.grad.size(), 1, [&](std::size_t i) {
-            in.grad[i] += out.grad[transposeIndex(i)];
+        // Backward walks the input in order, so each task owns a contiguous slice of in.grad.
+        detail::parallelRanges(out.pool, in.grad.size(), 1, [&](std::size_t begin, std::size_t end) {
+            walkStrided(s, outStrides, begin, end, [&](std::size_t i, std::size_t o) {
+                in.grad[i] += out.grad[o];
+            });
         });
     });
 }
@@ -626,17 +752,24 @@ BasicTensor BasicTensor::sum(std::optional<int> axis, bool keepDims) const {
     } else {
         dims.assign(keepDims ? shape().size() : 0, 1);
     }
+    // The input is {outer, width, stride} with the reduced axis in the middle; the output is
+    // {outer, stride}. Output (o, s) starts at input (o, 0, s) and steps by stride.
+    const std::size_t outer = value().size() / (width * stride);
     Values values(elementCount(dims));
-    detail::parallelFor(pool(), values.size(), width, [&](std::size_t i) {
-        const std::size_t base = (i / stride) * width * stride + i % stride;
-        double total = 0;
-        for (std::size_t j = 0; j < width; ++j) total += value()[base + j*stride];
-        values[i] = static_cast<float>(total);
+    const float* x = value().data();
+    detail::parallelRanges(pool(), values.size(), width, [&](std::size_t begin, std::size_t end) {
+        walkStrided({outer, stride}, {width*stride, 1}, begin, end, [&](std::size_t i, std::size_t base) {
+            double total = 0;
+            for (std::size_t j = 0; j < width; ++j) total += x[base + j*stride];
+            values[i] = static_cast<float>(total);
+        });
     });
-    return result(std::move(dims), std::move(values), {node_}, [width, stride](const Node& out) {
+    return result(std::move(dims), std::move(values), {node_}, [outer, width, stride](const Node& out) {
         Node& in = *out.parents[0];
-        detail::parallelFor(out.pool, in.grad.size(), 1, [&](std::size_t i) {
-            in.grad[i] += out.grad[(i / stride / width) * stride + i % stride];
+        // Input (o, w, s) reads output (o, s): stride 0 along the reduced axis.
+        detail::parallelRanges(out.pool, in.grad.size(), 1, [&](std::size_t begin, std::size_t end) {
+            walkStrided({outer, width, stride}, {stride, 0, 1}, begin, end,
+                        [&](std::size_t i, std::size_t o) { in.grad[i] += out.grad[o]; });
         });
     });
 }
@@ -687,9 +820,12 @@ BasicTensor BasicTensor::crossEntropy(const std::vector<std::size_t>& labels) co
 void BasicTensor::backward() const {
     if (!node_->requiresGrad) throw std::logic_error(notDifferentiable("backward", shape()));
     // Step 1: depth-first post-order over the nodes that need gradients, so each node comes
-    // after everything it reads. Shared nodes are visited once.
+    // after everything it reads. Shared nodes are visited once: each pass stamps the nodes
+    // it reaches with its own number. Concurrent passes touch disjoint graphs (graphs that
+    // share a parameter must not run backward concurrently anyway), so plain stamps suffice.
+    const std::uint64_t pass = backwardPasses.fetch_add(1, std::memory_order_relaxed) + 1;
     std::vector<Node*> order;
-    std::unordered_set<Node*> visited{node_.get()};
+    node_->visitMark = pass;
     std::vector<std::pair<Node*, std::size_t>> stack{{node_.get(), 0}};
     while (!stack.empty()) {
         auto& [node, next] = stack.back();
@@ -704,7 +840,10 @@ void BasicTensor::backward() const {
             throw std::logic_error("backward: an input of shape " + toString(parent->shape) +
                                    " was changed by step() after this graph was built; "
                                    "run the forward pass again");
-        if (parent->requiresGrad && visited.insert(parent).second) stack.emplace_back(parent, 0);
+        if (parent->requiresGrad && parent->visitMark != pass) {
+            parent->visitMark = pass;
+            stack.emplace_back(parent, 0);
+        }
     }
     // Step 2: intermediate gradients restart from zero; leaf gradients accumulate.
     for (Node* node : order)

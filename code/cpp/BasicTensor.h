@@ -55,8 +55,11 @@ private:
 };
 
 // A copy shares values, gradients and graph history. The pool must outlive its tensors.
-// Invalid shapes, pools, labels and domain errors (division by zero, log of a non-positive
-// value) throw with the shapes or values involved.
+// Invalid shapes, pools and labels throw std::invalid_argument naming the shapes. Domain
+// errors throw std::domain_error naming the element: division by zero, log of a value that
+// is not positive, pow outside its domain (negative base with a fractional exponent, zero
+// with a negative one, or zero with 0 < p < 1 when a gradient is needed). Results that
+// overflow float (exp, pow) throw std::overflow_error.
 class BasicTensor {
 public:
     BasicTensor(ndp::ForkJoinPool& pool, Shape shape, Values values, Grad grad = Grad::Required);
@@ -118,6 +121,8 @@ private:
     BasicTensor binary(const BasicTensor& rhs, Binary op) const;
     template<class Function, class Derivative>
     BasicTensor unary(Function f, Derivative derivative) const;
+    // A copy as a new graph node, so results never alias an input's gradient.
+    BasicTensor identity() const;
 
     Ptr node_;
 };

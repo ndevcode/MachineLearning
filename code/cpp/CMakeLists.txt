@@ -15,6 +15,13 @@
 cmake_minimum_required(VERSION 3.16)
 project(cpu_autograd LANGUAGES CXX)
 
+# Without a build type, single-config generators compile at -O0, which disables the
+# vectorization the kernels rely on. Default to Release; pass -DCMAKE_BUILD_TYPE to override.
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+    message(STATUS "CMAKE_BUILD_TYPE not set; using Release")
+endif()
+
 # Sanitizers for every target, e.g. -DCPU_AUTOGRAD_SANITIZE=address,undefined or =thread.
 # Under WSL2, ThreadSanitizer needs ASLR off: setarch -R ctest.
 set(CPU_AUTOGRAD_SANITIZE "" CACHE STRING "Comma-separated -fsanitize= list (address,undefined or thread)")
@@ -40,6 +47,13 @@ target_compile_features(cpu_autograd PUBLIC cxx_std_20)
 target_include_directories(cpu_autograd PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(cpu_autograd PUBLIC Threads::Threads)
 cpu_autograd_warnings(cpu_autograd)
+# No FMA contraction: a fused multiply-add rounds once, so whether the compiler fuses
+# depends on -march and on loop shape, and with it the last bits of every result. Off, the
+# kernels give the same bits at -O2, -O3 and -O3 -march=native, and across refactors that
+# keep each element's summation order. Builds without -march have no FMA, so it costs nothing.
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(cpu_autograd PRIVATE -ffp-contract=off)
+endif()
 
 add_executable(mnist mnist.cpp)
 target_link_libraries(mnist PRIVATE cpu_autograd)

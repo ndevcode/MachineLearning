@@ -73,12 +73,11 @@ void ForkJoinPool::wake(Signal& signal) {
 }
 
 ForkJoinPool::ForkJoinPool(unsigned nThreads)
-    : size_(nThreads), tickets_(nThreads ? new Signal[nThreads] : nullptr) {
+    : size_(nThreads), slots_(std::make_unique<Slot[]>(nThreads ? nThreads - 1 : 0)) {
     if (nThreads == 0) throw std::invalid_argument("ForkJoinPool: thread count must be positive");
     workers_.reserve(nThreads - 1);
     try {
-        for (unsigned task = 1; task < nThreads; ++task)
-            workers_.emplace_back(&ForkJoinPool::work, this, task);
+        for (unsigned w = 0; w + 1 < nThreads; ++w) workers_.emplace_back(&ForkJoinPool::work, this, w);
     } catch (...) {
         shutdown();
         throw;
@@ -86,37 +85,37 @@ ForkJoinPool::ForkJoinPool(unsigned nThreads)
 }
 
 ForkJoinPool::~ForkJoinPool() {
-    assert(!owned_.load() && "ForkJoinPool destroyed while a run() is in progress");
+    for (std::size_t w = 0; w < workers_.size(); ++w)
+        assert(!slots_[w].claimed.load() && "ForkJoinPool destroyed while a run() is in progress");
     shutdown();
 }
 
 void ForkJoinPool::shutdown() noexcept {
     stop_ = true;
-    for (unsigned w = 1; w <= workers_.size(); ++w) {
-        tickets_[w].value.fetch_add(1, std::memory_order_seq_cst);
-        tickets_[w].value.notify_one();
+    for (std::size_t w = 0; w < workers_.size(); ++w) {
+        slots_[w].ticket.value.fetch_add(1, std::memory_order_seq_cst);
+        slots_[w].ticket.value.notify_one();
     }
     for (auto& worker : workers_) worker.join();
 }
 
-void ForkJoinPool::record(std::exception_ptr error) noexcept {
-    if (!failed_.exchange(true, std::memory_order_relaxed)) error_ = std::move(error);
-}
-
-void ForkJoinPool::work(unsigned task) {
-    // Only the caller bumps this ticket, and only after this worker finished the previous
-    // run it was given, so each new ticket differs from `seen` and none is missed.
+void ForkJoinPool::work(unsigned worker) {
+    Slot& slot = slots_[worker];
+    // Only a claimer bumps this ticket, and it waits for `done` before releasing the slot,
+    // so each new ticket differs from `seen` and none is missed.
     std::uint32_t seen = 0;
     for (;;) {
-        seen = awaitChange(tickets_[task], seen);
+        seen = awaitChange(slot.ticket, seen);
         if (stop_) return;
         try {
-            invoke_(fn_, task, tasks_);
+            slot.invoke(slot.fn, slot.task, slot.tasks);
         } catch (...) {
-            record(std::current_exception());
+            slot.error = std::current_exception();
         }
-        // Release publishes this task's output writes (and error_) to the caller.
-        if (remaining_.value.fetch_sub(1, std::memory_order_seq_cst) == 1) wake(remaining_);
+        // Release publishes the task's output writes (and slot.error) to the claimer. After
+        // this the worker touches only the slot's atomics, so the claimer may reuse it.
+        slot.done.value.fetch_add(1, std::memory_order_seq_cst);
+        wake(slot.done);
     }
 }
 
@@ -124,32 +123,62 @@ void ForkJoinPool::dispatch(unsigned tasks, Invoke invoke, const void* fn) {
     if (tasks == 0 || tasks > size_)
         throw std::invalid_argument("ForkJoinPool::run: " + std::to_string(tasks) +
                                     " tasks requested from a pool of " + std::to_string(size_));
-    if (tasks == 1 || owned_.exchange(true, std::memory_order_acquire)) {
-        for (unsigned task = 0; task < tasks; ++task) invoke(fn, task, tasks);
+    if (tasks == 1) {
+        invoke(fn, 0, 1);
         return;
     }
-    invoke_ = invoke;
-    fn_ = fn;
-    tasks_ = tasks;
-    remaining_.value.store(tasks - 1, std::memory_order_relaxed);
-    for (unsigned w = 1; w < tasks; ++w) {
-        tickets_[w].value.fetch_add(1, std::memory_order_seq_cst);
-        wake(tickets_[w]);
+    // Step 1: hand tasks 1, 2, ... to workers no run has claimed. Usually few enough to
+    // record on the stack.
+    constexpr unsigned INLINE_SLOTS = 64;
+    unsigned inlineSlots[INLINE_SLOTS];
+    std::unique_ptr<unsigned[]> heapSlots;
+    unsigned* claimed = inlineSlots;
+    if (tasks - 1 > INLINE_SLOTS) claimed = (heapSlots = std::make_unique<unsigned[]>(tasks - 1)).get();
+    unsigned placed = 0, next = 1;
+    for (unsigned w = 0; w < workers_.size() && next < tasks; ++w) {
+        Slot& slot = slots_[w];
+        if (slot.claimed.load(std::memory_order_relaxed) ||
+            slot.claimed.exchange(true, std::memory_order_acquire))
+            continue;
+        slot.invoke = invoke;
+        slot.fn = fn;
+        slot.task = next++;
+        slot.tasks = tasks;
+        slot.error = nullptr;
+        slot.doneBefore = slot.done.value.load(std::memory_order_relaxed);
+        slot.ticket.value.fetch_add(1, std::memory_order_seq_cst);
+        wake(slot.ticket);
+        claimed[placed++] = w;
     }
 
-    try {
-        invoke(fn, 0, tasks);
-    } catch (...) {
-        record(std::current_exception());
-    }
-    // Workers still reference fn, so wait for them even if task 0 threw.
-    for (auto left = remaining_.value.load(std::memory_order_acquire); left != 0;)
-        left = awaitChange(remaining_, left);
+    // Step 2: task 0, and every task no idle worker took, run on this thread.
+    std::exception_ptr firstError;
+    unsigned firstErrorTask = tasks;
+    auto keep = [&](std::exception_ptr error, unsigned task) {
+        if (error && task < firstErrorTask) {
+            firstError = std::move(error);
+            firstErrorTask = task;
+        }
+    };
+    auto runHere = [&](unsigned task) {
+        try {
+            invoke(fn, task, tasks);
+        } catch (...) {
+            keep(std::current_exception(), task);
+        }
+    };
+    runHere(0);
+    for (unsigned task = next; task < tasks; ++task) runHere(task);
 
-    auto error = std::exchange(error_, nullptr);
-    failed_.store(false, std::memory_order_relaxed);
-    owned_.store(false, std::memory_order_release);
-    if (error) std::rethrow_exception(error);
+    // Step 3: wait for every claimed worker (they reference fn even if a task threw), take
+    // its exception, release it.
+    for (unsigned p = 0; p < placed; ++p) {
+        Slot& slot = slots_[claimed[p]];
+        awaitChange(slot.done, slot.doneBefore);
+        keep(std::exchange(slot.error, nullptr), slot.task);
+        slot.claimed.store(false, std::memory_order_release);
+    }
+    if (firstError) std::rethrow_exception(firstError);
 }
 
 } // namespace ndp

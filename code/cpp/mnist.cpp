@@ -20,6 +20,8 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <numeric>
+#include <random>
 #include <stdexcept>
 #include <string_view>
 
@@ -80,14 +82,15 @@ struct Dataset {
         return data;
     }
 
-    // Images [first, first + n) scaled to [0, 1], optionally shifted by up to one pixel.
+    // Images indexes[0..n) scaled to [0, 1], optionally shifted by up to one pixel.
     // Input data needs no gradient.
-    BasicTensor batch(ndp::ForkJoinPool& pool, std::size_t first, std::size_t n, std::mt19937* rng) const {
+    BasicTensor batch(ndp::ForkJoinPool& pool, const std::size_t* indexes, std::size_t n,
+                      std::mt19937* rng) const {
         const auto area = height*width;
         Values values(n*area);
         std::uniform_int_distribution<int> offset(-1, 1);
         for (std::size_t i = 0; i < n; ++i) {
-            const auto image = pixels.data() + (first + i)*area;
+            const auto image = pixels.data() + indexes[i]*area;
             const auto dest = values.data() + i*area;
             const int dx = rng ? offset(*rng) : 0, dy = rng ? offset(*rng) : 0;
             if (!dx && !dy) {
@@ -109,13 +112,16 @@ void train(ndp::ForkJoinPool& pool, const Dataset& data, const fs::path& checkpo
            std::size_t epochs, std::size_t batchSize) {
     MLP model(pool, data.width*data.height, {16, 8, 16, 10}, ml::Activation::Sigmoid);
     std::mt19937 rng(42);
+    std::vector<std::size_t> order(data.labels.size());
+    std::iota(order.begin(), order.end(), std::size_t{0});
     for (std::size_t epoch = 0; epoch < epochs; ++epoch) {
+        std::shuffle(order.begin(), order.end(), rng);  // seeded: reproducible runs
         double squaredError = 0;
-        for (std::size_t i = 0; i < data.labels.size();) {
-            const auto n = std::min(batchSize, data.labels.size() - i);
-            const auto x = data.batch(pool, i, n, epoch ? &rng : nullptr);
+        for (std::size_t i = 0; i < order.size();) {
+            const auto n = std::min(batchSize, order.size() - i);
+            const auto x = data.batch(pool, order.data() + i, n, epoch ? &rng : nullptr);
             Values targets(n*10);
-            for (std::size_t j = 0; j < n; ++j) targets[j*10 + data.labels[i + j]] = 1;
+            for (std::size_t j = 0; j < n; ++j) targets[j*10 + data.labels[order[i + j]]] = 1;
             model.zeroGrad();
             // Operation-level splitting, not MLP::backwardSharded: the 784-wide first layer
             // dominates and splits well, and sharding measured 2x slower here (README).
@@ -141,10 +147,12 @@ void evaluate(ndp::ForkJoinPool& pool, const Dataset& data, const MLP& model) {
                                  std::to_string(outputs) + " outputs; MNIST needs " +
                                  std::to_string(data.height*data.width) + " to 10");
     ml::NoGradGuard inference;  // no graph and no gradient buffers
+    std::vector<std::size_t> order(data.labels.size());
+    std::iota(order.begin(), order.end(), std::size_t{0});
     std::size_t correct = 0;
     for (std::size_t i = 0; i < data.labels.size();) {
         const auto n = std::min<std::size_t>(128, data.labels.size() - i);
-        const auto predictions = model(data.batch(pool, i, n, nullptr));
+        const auto predictions = model(data.batch(pool, order.data() + i, n, nullptr));
         for (std::size_t j = 0; j < n; ++j) {
             const auto scores = predictions.value().begin() + std::ptrdiff_t(10*j);
             correct += std::max_element(scores, scores + 10) - scores == data.labels[i + j];
@@ -176,7 +184,16 @@ int main(int argc, char** argv) {
         const auto epochs = argc > 3 ? positive(argv[3]) : 25;
         const auto batch = argc > 4 ? positive(argv[4]) : 1;
         ndp::ForkJoinPool pool(argc > 5 ? positive(argv[5]) : std::max(1u, std::thread::hardware_concurrency()));
-        if (!fs::exists(model)) train(pool, Dataset::load(dir, "train"), model, epochs, batch);
+        if (fs::exists(model)) {
+            // Training arguments would be ignored: refuse rather than evaluate something else.
+            if (argc > 3)
+                throw std::invalid_argument("checkpoint " + model.string() + " already exists; delete it "
+                                            "to retrain with EPOCHS/BATCH_SIZE, or omit them to evaluate it");
+            std::cerr << "mnist: evaluating existing checkpoint " << model.string()
+                      << " (delete it to retrain)\n";
+        } else {
+            train(pool, Dataset::load(dir, "train"), model, epochs, batch);
+        }
         evaluate(pool, Dataset::load(dir, "t10k"), MLP::load(pool, model));
     } catch (const std::exception& e) {
         std::cerr << "mnist: " << e.what() << '\n';

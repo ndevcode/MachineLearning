@@ -26,20 +26,23 @@ namespace ndp {
 
 // Fork-join pool for statically partitioned data-parallel loops. No mutex anywhere.
 //
-// run(tasks, f) calls f(task, tasks) exactly once for every task in [0, tasks). The
-// calling thread runs task 0 and worker w runs task w. Each task derives the output
-// indexes it owns from its task number, so there is no job queue to protect:
-//   dispatch   = write the callable, then bump the ticket of each worker that has a task;
-//   completion = each of those workers decrements remaining_; the caller waits for zero.
-// The ticket store (release) and the remaining_ decrement / caller load (acquire) are the
-// barrier: every write made by a task happens-before run() returns. Workers without a
-// task are not signalled and not waited for. Idle threads spin briefly, then sleep on a
-// futex via C++20 atomic wait (libstdc++ on Linux: SYS_futex, no lock).
+// run(tasks, f) calls f(task, tasks) exactly once for every task in [0, tasks). Each task
+// derives the output indexes it owns from its task number, so there is no job queue:
+//   dispatch   = claim an idle worker (compare-and-swap on its slot), write the task into
+//                the slot, bump the slot's ticket;
+//   completion = the worker bumps the slot's done counter; the caller waits for it, then
+//                releases the slot.
+// The ticket store (release) and the done counter (release, then acquire by the caller)
+// are the barrier: every write made by a task happens-before run() returns. The calling
+// thread runs task 0, plus any task for which no worker was idle. Idle threads spin
+// briefly, then sleep on a futex via C++20 atomic wait (libstdc++ on Linux: SYS_futex,
+// no lock).
 //
-// One run() owns the workers at a time. A run() that finds them owned (a second caller
-// thread, or a nested call from inside a task) runs its tasks serially on its own
-// thread. That is correct because a task's results depend only on its number, not on
-// the thread that runs it.
+// Any number of callers can run at once, nested runs included: each claims whichever
+// workers are idle, so a second caller or an inner run uses the workers an outer run left
+// free rather than falling back to serial. Waits form a tree (a thread waits only on
+// workers it claimed), so they cannot deadlock. Which thread runs a task never changes
+// its result. If tasks throw, run() rethrows the exception of the lowest-numbered one.
 class ForkJoinPool {
 public:
     // nThreads counts the calling thread, so nThreads - 1 workers are started.
@@ -53,8 +56,8 @@ public:
 
     unsigned size() const { return size_; }
 
-    // Requires 1 <= tasks <= size(). Blocks until all tasks finish and rethrows the
-    // first exception a task threw.
+    // Requires 1 <= tasks <= size(). Blocks until all tasks finish, then rethrows the
+    // exception of the lowest-numbered task that threw.
     template<class Function> void run(unsigned tasks, Function&& f) {
         using F = std::remove_reference_t<Function>;
         dispatch(tasks,
@@ -77,26 +80,30 @@ private:
     static std::uint32_t awaitChange(Signal& signal, std::uint32_t old);
     static void wake(Signal& signal);
 
+    // One per worker. A caller claims an idle worker by setting `claimed`, writes the task
+    // into the plain fields and bumps `ticket`. The worker runs it, stores any exception
+    // and bumps `done`. The caller sees `done` change, takes the exception and clears
+    // `claimed`. Each handoff is a release/acquire pair, so every plain field is touched
+    // by one thread at a time.
+    struct Slot {
+        Signal ticket;
+        Signal done;
+        alignas(64) std::atomic<bool> claimed{false};
+        Invoke invoke = nullptr;
+        const void* fn = nullptr;
+        unsigned task = 0, tasks = 0;
+        std::uint32_t doneBefore = 0;  // done.value when claimed; read only by the claimer
+        std::exception_ptr error;
+    };
+
     void dispatch(unsigned tasks, Invoke invoke, const void* fn);
-    void work(unsigned task);
-    void record(std::exception_ptr error) noexcept;
+    void work(unsigned worker);
     void shutdown() noexcept;
 
     const unsigned size_;
-    std::unique_ptr<Signal[]> tickets_;  // tickets_[w] is worker w's; index 0 is unused
+    std::unique_ptr<Slot[]> slots_;  // slots_[w] belongs to worker w
     std::vector<std::thread> workers_;
-
-    // Plain fields: written by the owning caller before the tickets are released and read
-    // only by signalled workers, which the caller waits for before writing them again.
-    Invoke invoke_ = nullptr;
-    const void* fn_ = nullptr;
-    unsigned tasks_ = 0;
-    bool stop_ = false;
-    std::exception_ptr error_;  // written only by the thread that wins failed_
-
-    Signal remaining_;  // workers of the current run still working; the caller waits on it
-    alignas(64) std::atomic<bool> owned_{false};
-    std::atomic<bool> failed_{false};
+    bool stop_ = false;  // written before the shutdown tickets, read after them
 };
 
 } // namespace ndp

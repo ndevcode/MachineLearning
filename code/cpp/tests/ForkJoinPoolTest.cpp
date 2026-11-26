@@ -22,6 +22,7 @@
 #include "Parallel.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <chrono>
 #include <iostream>
@@ -61,9 +62,19 @@ void testEachTaskOncePerRun() {
     std::cout << "PASSED\n";
 }
 
-// A run() from inside a task cannot get the workers, so it runs serially in place.
-void testNestedRunIsSerial() {
-    std::cout << "testNestedRunIsSerial... ";
+// Waits up to 10 s for `flag`; a hang would otherwise only show as a CTest timeout.
+void awaitFlag(const std::atomic<bool>& flag, const char* what) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (!flag.load(std::memory_order_acquire)) {
+        assert(std::chrono::steady_clock::now() < deadline && what);
+        std::this_thread::yield();
+    }
+}
+
+// Nested runs cover every task once. With every worker busy the inner runs execute in
+// place; with workers left idle by the outer run, the inner runs claim them.
+void testNestedRun() {
+    std::cout << "testNestedRun... ";
     ForkJoinPool pool(4);
     std::vector<std::vector<int>> inner(4, std::vector<int>(4, 0));
     pool.run([&](unsigned outer, unsigned) {
@@ -71,11 +82,53 @@ void testNestedRunIsSerial() {
     });
     for (const auto& row : inner)
         for (int hit : row) assert(hit == 1 && "nested run must cover every task once");
+
+    // Outer run of 2 leaves 2 of 3 workers idle; each inner run of 2 claims one of them.
+    // The inner task 1s rendezvous so both inner runs hold their worker at once; otherwise
+    // the second could legitimately reuse the worker the first had already released.
+    std::vector<std::thread::id> innerCaller(2), innerWorker(2);
+    std::atomic<int> started{0};
+    std::atomic<bool> bothStarted{false};
+    pool.run(2u, [&](unsigned outer, unsigned) {
+        innerCaller[outer] = std::this_thread::get_id();
+        pool.run(2u, [&](unsigned task, unsigned) {
+            if (task != 1) return;
+            innerWorker[outer] = std::this_thread::get_id();
+            if (started.fetch_add(1) + 1 == 2) bothStarted.store(true, std::memory_order_release);
+            awaitFlag(bothStarted, "the two inner runs never held workers at the same time");
+        });
+    });
+    for (unsigned outer = 0; outer < 2; ++outer)
+        assert(innerWorker[outer] != innerCaller[outer] && "an inner run must use an idle worker");
+    assert(innerWorker[0] != innerWorker[1] && "two inner runs must not share a worker");
     std::cout << "PASSED\n";
 }
 
-// Two caller threads share one pool: one owns the workers, the other falls back to
-// serial. Both must see complete, correct results.
+// A second caller is not serialized behind the first: it claims the workers the first
+// run left idle while that run is still in progress.
+void testSecondCallerGetsIdleWorkers() {
+    std::cout << "testSecondCallerGetsIdleWorkers... ";
+    ForkJoinPool pool(5);
+    std::atomic<bool> firstRunning{false}, secondDone{false};
+    std::thread first([&] {
+        pool.run(2u, [&](unsigned task, unsigned) {
+            if (task != 1) return;
+            firstRunning.store(true, std::memory_order_release);
+            awaitFlag(secondDone, "second caller did not finish while the first run was held");
+        });
+    });
+    awaitFlag(firstRunning, "first run did not start");
+    std::vector<std::thread::id> ids(3);
+    pool.run(3u, [&](unsigned task, unsigned) { ids[task] = std::this_thread::get_id(); });
+    secondDone.store(true, std::memory_order_release);
+    first.join();
+    assert(ids[1] != ids[0] && ids[2] != ids[0] && ids[1] != ids[2] &&
+           "the second caller must run its tasks on idle workers, not serially");
+    std::cout << "PASSED\n";
+}
+
+// Two caller threads share one pool, each claiming whatever workers are idle. Both must
+// see complete, correct results.
 void testConcurrentCallers() {
     std::cout << "testConcurrentCallers... ";
     ForkJoinPool pool(4);
@@ -110,14 +163,20 @@ void testExceptionsPropagate() {
         pool.run([&](unsigned task, unsigned) { ++hits[task]; });
         for (int hit : hits) assert(hit == 1 && "pool must stay usable after an exception");
     }
-    // Every task throws at once: exactly one exception reaches the caller.
-    int caught = 0;
-    try {
-        pool.run([](unsigned task, unsigned) { throw std::runtime_error(std::to_string(task)); });
-    } catch (const std::runtime_error&) {
-        ++caught;
-    }
-    assert(caught == 1 && "concurrent throws must surface as one exception");
+    // Several tasks throw: the lowest-numbered task's exception surfaces, whichever finished first.
+    auto surfaced = [&](auto throws) {
+        try {
+            pool.run([&](unsigned task, unsigned) {
+                if (throws(task)) throw std::runtime_error(std::to_string(task));
+            });
+        } catch (const std::runtime_error& e) {
+            return std::string(e.what());
+        }
+        return std::string("none");
+    };
+    assert(surfaced([](unsigned task) { return task == 1 || task == 3; }) == "1" &&
+           "the lowest-numbered throwing task must win");
+    assert(surfaced([](unsigned) { return true; }) == "0" && "task 0 wins when every task throws");
     std::vector<int> hits(4, 0);
     pool.run([&](unsigned task, unsigned) { ++hits[task]; });
     for (int hit : hits) assert(hit == 1 && "pool must stay usable after concurrent throws");
@@ -132,9 +191,10 @@ void testWakeAfterSleep() {
     std::vector<int> hits(4, 0);
     for (int r = 1; r <= 20; ++r) {
         std::this_thread::sleep_for(IDLE_TIME);
-        // Task 0 (the caller) is the slow one, so the caller must also sleep while waiting.
+        // On odd rounds a worker's task is the slow one, so the caller sleeps on the futex
+        // while waiting for it and must be woken by that worker.
         pool.run([&](unsigned task, unsigned) {
-            if (task == 0 && r % 2) std::this_thread::sleep_for(IDLE_TIME);
+            if (task == 3 && r % 2) std::this_thread::sleep_for(IDLE_TIME);
             ++hits[task];
         });
         for (int hit : hits) assert(hit == r && "a task was lost or repeated after a sleep");
@@ -250,7 +310,8 @@ void testRejectsBadCounts() {
 
 int main() {
     testEachTaskOncePerRun();
-    testNestedRunIsSerial();
+    testNestedRun();
+    testSecondCallerGetsIdleWorkers();
     testConcurrentCallers();
     testExceptionsPropagate();
     testPartialRuns();

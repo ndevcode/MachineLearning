@@ -16,15 +16,32 @@
 #include "Parallel.h"
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <fstream>
 #include <limits>
 #include <numeric>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 
 namespace ml {
 namespace {
+
+// Checkpoints are little-endian: the byte order of the x86 machines that wrote the legacy
+// files, now stated rather than inherited from the host. Big-endian hosts swap.
+static_assert(std::endian::native == std::endian::little || std::endian::native == std::endian::big,
+              "checkpoint I/O assumes a little- or big-endian host");
+template<class T> T littleEndian(T value) {
+    static_assert(sizeof(T) == 1 || sizeof(T) == 4, "checkpoints hold bytes and 32-bit values");
+    if constexpr (std::endian::native == std::endian::little || sizeof(T) == 1) {
+        return value;
+    } else {
+        auto bits = std::bit_cast<std::uint32_t>(value);
+        bits = (bits >> 24) | ((bits >> 8) & 0xff00u) | ((bits << 8) & 0xff0000u) | (bits << 24);
+        return std::bit_cast<T>(bits);
+    }
+}
 
 Values initialize(std::size_t in, std::size_t out, std::mt19937& rng) {
     if (!in || !out || out > Values().max_size() / in)
@@ -56,6 +73,7 @@ public:
         if (!file_.read(reinterpret_cast<char*>(v.data()), static_cast<std::streamsize>(bytes)))
             throw std::runtime_error("checkpoint read error: " + path_.string());
         remaining_ -= bytes;
+        for (T& x : v) x = littleEndian(x);  // no-op on little-endian hosts
         return v;
     }
     std::uint32_t count() { return read<std::uint32_t>(1)[0]; }
@@ -73,7 +91,21 @@ std::uint32_t fileCount(std::uint64_t size) {
 }
 
 template<class T> void write(std::ostream& stream, const T* data, std::size_t size) {
-    stream.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(size*sizeof(T)));
+    if constexpr (std::endian::native == std::endian::little || sizeof(T) == 1) {
+        stream.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(size*sizeof(T)));
+    } else {
+        std::vector<T> swapped(data, data + size);
+        for (T& x : swapped) x = littleEndian(x);
+        stream.write(reinterpret_cast<const char*>(swapped.data()),
+                     static_cast<std::streamsize>(size*sizeof(T)));
+    }
+}
+
+// Errors from link() on filesystems that have no hard links (FAT, exFAT, some network
+// shares) rather than errors about these particular paths.
+bool linksUnsupported(const std::error_code& error) {
+    return error == std::errc::operation_not_permitted || error == std::errc::operation_not_supported ||
+           error == std::errc::function_not_supported;
 }
 
 } // namespace
@@ -158,9 +190,13 @@ float MLP::backwardSharded(const BasicTensor& x, std::size_t shards, const Shard
     std::vector<double> shardLosses(shards);
 
     // Step 1: one task per thread, each running shards t, t + tasks, ... on its own replica,
-    // so tasks share nothing they write. While the pool is busy with these tasks, the
-    // operations inside a shard run serially; either way a shard's arithmetic does not
-    // depend on which thread runs it.
+    // so tasks share nothing they write. Operations inside a shard use whatever workers are
+    // still idle (none, once every thread has a shard); either way a shard's arithmetic
+    // does not depend on which thread runs it.
+    //
+    // Every shard's gradients are kept until Step 2 (shards x parameters floats). Summing
+    // per task instead would save memory, but the grouping, and so the rounding, would then
+    // depend on the thread count.
     const auto tasks = static_cast<unsigned>(std::min<std::size_t>(pool.size(), shards));
     detail::runTasks(pool, tasks, [&](unsigned task) {
         MLP replica = replicate();
@@ -237,7 +273,19 @@ void MLP::save(const std::filesystem::path& path) const {
             }
         }
         file.close();
-        fs::create_hard_link(staged, path);
+        std::error_code linkError;
+        fs::create_hard_link(staged, path, linkError);
+        if (linkError && !linksUnsupported(linkError))
+            throw fs::filesystem_error("MLP::save: cannot publish checkpoint", staged, path, linkError);
+        if (linkError) {
+            // No hard links here. rename() still publishes only a complete file, but it
+            // replaces an existing one, so check first. A trainer that creates `path`
+            // between the check and the rename can be overwritten; only on such filesystems.
+            if (fs::exists(path))
+                throw fs::filesystem_error("MLP::save: checkpoint already exists", path,
+                                           std::make_error_code(std::errc::file_exists));
+            fs::rename(staged, path);
+        }
     } catch (...) {
         std::error_code ignored;
         fs::remove_all(staging, ignored);

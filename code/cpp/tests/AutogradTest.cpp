@@ -261,6 +261,93 @@ void domainErrors(ndp::ForkJoinPool& pool) {
     rejectsWith<std::domain_error>("element 0", [&] { BasicTensor(pool, {1}, {std::nanf("")}).log(); });
     auto small = x / 1e-30f;  // tiny but nonzero divisors divide exactly
     near(small.value()[0], 1e30f, 1e24f);
+
+    // pow: undefined points and poles throw; so does an infinite slope when a gradient is needed.
+    rejectsWith<std::domain_error>("element 1 of shape {2} is -1",
+                                   [&] { BasicTensor(pool, {2}, {4, -1}).pow(0.5f); });
+    rejectsWith<std::domain_error>("is undefined", [&] { BasicTensor(pool, {1}, {0}).pow(-1); });
+    rejectsWith<std::domain_error>("infinite slope", [&] { BasicTensor(pool, {1}, {0}).pow(0.5f); });
+    near(BasicTensor(pool, {1}, {0}, Grad::None).pow(0.5f).value()[0], 0);  // value alone is fine
+    near(BasicTensor(pool, {1}, {-2}).pow(2).value()[0], 4);               // integer exponent
+    rejectsWith<std::overflow_error>("pow: element 0", [&] { BasicTensor(pool, {1}, {10}).pow(50); });
+    rejectsWith<std::overflow_error>("exp: element 1 of shape {2} overflows",
+                                     [&] { BasicTensor(pool, {2}, {0, 100}).exp(); });
+    near(BasicTensor(pool, {1}, {-200}).exp().value()[0], 0);  // underflow to 0 is exact enough
+}
+
+// Destroying the last handle to a long chain must not recurse once per node. 300,000
+// nodes overflowed an 8 MB stack before Node's destructor unlinked parents iteratively.
+void deepGraphTeardown(ndp::ForkJoinPool& pool) {
+    BasicTensor x(pool, 1.f);
+    {
+        BasicTensor y = x;
+        for (int i = 0; i < 400'000; ++i) y = y * 1.f;
+        check(y.requiresGrad(), "the chain records a graph");
+    }
+    check(x.value()[0] == 1.f, "the leaf survives its consumers");
+}
+
+// Results are new nodes, never aliases of their input: y.grad restarts at 1 on every
+// backward pass while the leaf x accumulates.
+void noAliasing(ndp::ForkJoinPool& pool) {
+    for (int variant = 0; variant < 2; ++variant) {
+        BasicTensor x(pool, {3}, {1, 2, 3});
+        auto y = variant == 0 ? x.activate(std::vector<Activation>(3, Activation::Linear)) : x.transpose();
+        y.backward();
+        y.backward();
+        check(x.grad() == Values{2, 2, 2}, "leaf gradient accumulates");
+        check(y.grad() == Values{1, 1, 1}, variant == 0 ? "activate(Linear) aliased its input"
+                                                          : "transpose of a vector aliased its input");
+    }
+}
+
+// transpose and sum by axis against naive index arithmetic, including the gradients.
+void transposeAndSumMatchReference(ndp::ForkJoinPool& pool) {
+    const Shape s{3, 1, 4, 5};
+    const std::size_t n = 60, rank = s.size();
+    Values xv = wave(n, 0.4f), weights = wave(n, 1.3f);
+    auto coords = [&](std::size_t i) {
+        Shape c(rank);
+        for (std::size_t a = rank; a-- > 0;) { c[a] = i % s[a]; i /= s[a]; }
+        return c;
+    };
+    BasicTensor x(pool, s, xv);
+    auto t = x.transpose();
+    check(t.shape() == Shape{5, 4, 1, 3}, "transpose shape");
+    (t * BasicTensor(pool, t.shape(), weights, Grad::None)).sum().backward();
+    Values expected(n), dx(n);
+    for (std::size_t i = 0; i < n; ++i) {
+        const Shape c = coords(i);
+        const std::size_t o = ((c[3]*4 + c[2])*1 + c[1])*3 + c[0];  // reversed axes
+        expected[o] = xv[i];
+        dx[i] = weights[o];
+    }
+    check(t.value() == expected && x.grad() == dx, "transpose value or gradient");
+
+    for (int axis = 0; axis < int(rank); ++axis) {
+        BasicTensor y(pool, s, xv);
+        auto r = y.sum(axis);
+        Shape rs = s;
+        rs.erase(rs.begin() + axis);
+        check(r.shape() == rs, "sum shape");
+        std::size_t outCount = 1;
+        for (auto d : rs) outCount *= d;
+        const Values w = wave(outCount, 2.1f);
+        (r * BasicTensor(pool, rs, w, Grad::None)).sum().backward();
+        std::vector<double> totals(outCount, 0);
+        Values dy(n);
+        for (std::size_t i = 0; i < n; ++i) {
+            Shape c = coords(i);
+            c.erase(c.begin() + axis);
+            std::size_t o = 0;
+            for (std::size_t a = 0; a < rs.size(); ++a) o = o*rs[a] + c[a];
+            totals[o] += xv[i];
+            dy[i] = w[o];
+        }
+        Values sums(outCount);
+        for (std::size_t o = 0; o < outCount; ++o) sums[o] = static_cast<float>(totals[o]);
+        check(r.value() == sums && y.grad() == dy, "sum over axis " + std::to_string(axis));
+    }
 }
 
 void errorMessagesCarryShapes(ndp::ForkJoinPool& pool) {
@@ -405,6 +492,13 @@ void checkpoint(ndp::ForkJoinPool& pool, const fs::path& dir) {
     near(y.value()[1], 1/(1 + std::exp(-0.5f)));
     model.save(saved);
     check(MLP::load(pool, saved)(x).value() == y.value(), "checkpoint prediction changed");
+    {
+        std::ifstream file(saved, std::ios::binary);
+        unsigned char first[4]{};
+        file.read(reinterpret_cast<char*>(first), 4);
+        check(first[0] == 2 && first[1] == 0 && first[2] == 0 && first[3] == 0,
+              "checkpoint counts are little-endian");
+    }
     rejects([&] { model.save(saved); });
     fs::resize_file(saved, fs::file_size(saved) - 1);
     rejectsWith<std::runtime_error>("truncated checkpoint", [&] { MLP::load(pool, saved); });
@@ -425,6 +519,10 @@ int main() {
         denseMatchesComposition(single);
         denseMatchesComposition(multi);
         domainErrors(multi);
+        deepGraphTeardown(single);
+        noAliasing(multi);
+        transposeAndSumMatchReference(single);
+        transposeAndSumMatchReference(multi);
         errorMessagesCarryShapes(multi);
         gradientModes(multi);
         shardedTraining(single, odd, multi);
