@@ -1,4 +1,3 @@
-// Adapted from ndplace src/base/ThreadPoolTest.cpp.
 #ifdef NDEBUG
 #undef NDEBUG
 #endif

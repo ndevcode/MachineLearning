@@ -1,6 +1,6 @@
 # CPU autograd
 
-A C++17 library based on the CUDA project's `BasicTensor`, `Module`, `Layer`, and `MLP`. The matrix and activation kernels use the ndplace thread pool. Build from the repository root with CMake and a C++ compiler.
+A C++17 library based on the CUDA project's `BasicTensor`, `Module`, `Layer`, and `MLP`. The matrix and activation kernels use `ndp::ThreadPool`. Build from the repository root with CMake and a C++ compiler.
 
 ```sh
 cmake -S code/cpp -B build/cpp -DCMAKE_BUILD_TYPE=Release
