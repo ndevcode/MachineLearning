@@ -17,16 +17,23 @@ cd -- "$(dirname -- "${BASH_SOURCE[0]}")"
 files=(
     BasicTensor.cpp BasicTensor.h
     Module.cpp Module.h Parallel.h
-    base/ThreadJob.h base/ThreadPool.cpp base/ThreadPool.h
-    mnist.cpp tests/AutogradTest.cpp tests/ThreadPoolTest.cpp
+    base/ForkJoinPool.cpp base/ForkJoinPool.h
+    mnist.cpp tests/AutogradTest.cpp tests/ForkJoinPoolTest.cpp
     CMakeLists.txt README.md checkin.sh
 )
+# Replaced by base/ForkJoinPool. Deleted from the repository by the next --commit.
+removed=(
+    base/ThreadJob.h base/ThreadPool.cpp base/ThreadPool.h tests/ThreadPoolTest.cpp
+)
+# The removed paths that HEAD still contains. Empty once the deletion is committed.
+mapfile -t stale < <(git ls-tree -r --name-only HEAD -- "${removed[@]}")
 
 if [[ $mode == --dry-run ]]; then
-    git --no-optional-locks status --short --untracked-files=all -- "${files[@]}"
+    git --no-optional-locks status --short --untracked-files=all -- "${files[@]}" "${stale[@]}"
     exit 0
 fi
 
-message=${2:-Add multithreaded C++ autograd library and MNIST example}
+message=${2:-Replace mutex ThreadPool with lock-free ForkJoinPool and fused dense layer}
 git add -A -- "${files[@]}"
-git commit --only -m "$message" -- "${files[@]}"
+if (( ${#stale[@]} )); then git rm -q --ignore-unmatch -- "${stale[@]}"; fi
+git commit --only -m "$message" -- "${files[@]}" "${stale[@]}"

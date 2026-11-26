@@ -57,7 +57,7 @@ template<class T> void write(std::ostream& stream, const T* data, std::size_t si
 void Module::zero_grad() { for (auto p : parameters()) p.zero_grad(); }
 void Module::step(float lr) { for (auto p : parameters()) p.step(lr); }
 
-Layer::Layer(ndp::ThreadPool& pool, std::size_t nin, std::size_t nout,
+Layer::Layer(ndp::ForkJoinPool& pool, std::size_t nin, std::size_t nout,
              Activation activation, std::mt19937& rng)
     : W(pool, {nout, nin}, initialize(nin, nout, rng)), b(pool, {nout}, Values(nout)),
       activations_(nout, activation) {}
@@ -70,10 +70,12 @@ Layer::Layer(BasicTensor weights, BasicTensor bias, std::vector<Activation> acti
 }
 
 BasicTensor Layer::forward(const BasicTensor& x) const {
-    return (x.matmul(W.T()) + b).activate(activations_);
+    // Same math as (x.matmul(W.T()) + b).activate(activations_), without materializing Wᵀ
+    // and with one barrier per layer instead of four. AutogradTest checks the two agree.
+    return x.dense(W, b, activations_);
 }
 
-MLP::MLP(ndp::ThreadPool& pool, std::size_t nin, const Shape& widths,
+MLP::MLP(ndp::ForkJoinPool& pool, std::size_t nin, const Shape& widths,
          Activation output, std::uint32_t seed) {
     if (widths.empty()) throw std::invalid_argument("MLP needs an output layer");
     std::mt19937 rng(seed);
@@ -145,7 +147,7 @@ void MLP::save(const std::filesystem::path& path) const {
     fs::remove_all(staging);
 }
 
-MLP MLP::load(ndp::ThreadPool& pool, const std::filesystem::path& path) {
+MLP MLP::load(ndp::ForkJoinPool& pool, const std::filesystem::path& path) {
     Reader reader(path);
     auto count = reader.count(), connections = reader.count();
     if (count < 2 || connections != count-1) throw std::runtime_error("invalid checkpoint topology");

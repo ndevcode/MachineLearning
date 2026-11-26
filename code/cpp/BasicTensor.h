@@ -1,6 +1,6 @@
 #pragma once
 
-#include "base/ThreadPool.h"
+#include "base/ForkJoinPool.h"
 
 #include <cstddef>
 #include <functional>
@@ -17,13 +17,13 @@ enum class Activation { Sigmoid, ReLU, Linear };
 // A copy shares values, gradients and graph history. The pool must outlive its tensors.
 class BasicTensor {
 public:
-    BasicTensor(ndp::ThreadPool& pool, Shape shape, Values values);
-    BasicTensor(ndp::ThreadPool& pool, float scalar);
+    BasicTensor(ndp::ForkJoinPool& pool, Shape shape, Values values);
+    BasicTensor(ndp::ForkJoinPool& pool, float scalar);
 
     const Shape& shape() const;
     const Values& value() const;
     const Values& grad() const;
-    ndp::ThreadPool& pool() const;
+    ndp::ForkJoinPool& pool() const;
 
     BasicTensor operator+(const BasicTensor& rhs) const;
     BasicTensor operator-(const BasicTensor& rhs) const;
@@ -45,6 +45,11 @@ public:
     BasicTensor activate(const std::vector<Activation>& columns) const;
 
     BasicTensor matmul(const BasicTensor& rhs) const;
+    // One dense layer as a single graph node: activations[j](x Wᵀ + b) for x {in} or
+    // {batch, in}, weights {out, in}, bias {out}. Forward is one parallel pass and so is
+    // backward; within each pass every thread writes only the output indexes it owns.
+    BasicTensor dense(const BasicTensor& weights, const BasicTensor& bias,
+                      const std::vector<Activation>& activations) const;
     BasicTensor T() const;
     BasicTensor sum(std::optional<int> axis = {}, bool keepdims = false) const;
     BasicTensor mean() const;

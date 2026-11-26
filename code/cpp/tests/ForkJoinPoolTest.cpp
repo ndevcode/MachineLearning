@@ -1,0 +1,250 @@
+#ifdef NDEBUG
+#undef NDEBUG
+#endif
+// Tests for ndp::ForkJoinPool and the partitioning helpers in Parallel.h built on it.
+// CMake also builds this file as ForkJoinPoolSleepTest with NDP_SPIN_MICROSECONDS=0,
+// so that every wait goes through the futex sleep/wake handshake. Run both under TSan.
+#include "base/ForkJoinPool.h"
+#include "Parallel.h"
+
+#include <algorithm>
+#include <cassert>
+#include <chrono>
+#include <iostream>
+#include <stdexcept>
+#include <string>
+#include <thread>
+#include <vector>
+
+#ifndef FJP_TEST_RUNS
+#define FJP_TEST_RUNS 20000
+#endif
+
+using ndp::ForkJoinPool;
+namespace detail = ml::detail;
+
+// Longer than the pool's default 2 ms spin, so idle threads are asleep on the futex.
+constexpr auto kIdle = std::chrono::milliseconds(10);
+
+// Every task index runs exactly once per run(), and its plain (non-atomic) writes to
+// its own slot are visible to the caller when run() returns.
+void testEachTaskOncePerRun() {
+    std::cout << "testEachTaskOncePerRun... ";
+    for (unsigned n : {1u, 2u, 3u, 8u}) {
+        ForkJoinPool pool(n);
+        assert(pool.size() == n && "size() counts the calling thread");
+        std::vector<long> hits(n, 0);
+        constexpr int runs = FJP_TEST_RUNS;
+        for (int r = 0; r < runs; ++r) {
+            pool.run([&](unsigned task, unsigned tasks) {
+                assert(tasks == n && "run() passes the pool size as the task count");
+                ++hits[task];
+            });
+            for (unsigned t = 0; t < n; ++t)
+                assert(hits[t] == r + 1 && "a task was skipped, repeated, or not yet visible");
+        }
+    }
+    std::cout << "PASSED\n";
+}
+
+// A run() from inside a task cannot get the workers, so it runs serially in place.
+void testNestedRunIsSerial() {
+    std::cout << "testNestedRunIsSerial... ";
+    ForkJoinPool pool(4);
+    std::vector<std::vector<int>> inner(4, std::vector<int>(4, 0));
+    pool.run([&](unsigned outer, unsigned) {
+        pool.run([&](unsigned task, unsigned) { ++inner[outer][task]; });
+    });
+    for (const auto& row : inner)
+        for (int hit : row) assert(hit == 1 && "nested run must cover every task once");
+    std::cout << "PASSED\n";
+}
+
+// Two caller threads share one pool: one owns the workers, the other falls back to
+// serial. Both must see complete, correct results.
+void testConcurrentCallers() {
+    std::cout << "testConcurrentCallers... ";
+    ForkJoinPool pool(4);
+    constexpr long runs = FJP_TEST_RUNS / 4;
+    auto caller = [&](std::vector<long>& sums) {
+        for (long r = 0; r < runs; ++r)
+            pool.run([&](unsigned task, unsigned) { sums[task] += task + 1; });
+    };
+    std::vector<long> a(4, 0), b(4, 0);
+    std::thread first(caller, std::ref(a)), second(caller, std::ref(b));
+    first.join();
+    second.join();
+    for (unsigned t = 0; t < 4; ++t)
+        assert(a[t] == runs*(t+1) && b[t] == runs*(t+1) && "concurrent callers lost work");
+    std::cout << "PASSED\n";
+}
+
+void testExceptionsPropagate() {
+    std::cout << "testExceptionsPropagate... ";
+    ForkJoinPool pool(4);
+    for (unsigned thrower : {0u, 3u}) {  // caller's own task, then a worker's
+        bool caught = false;
+        try {
+            pool.run([&](unsigned task, unsigned) {
+                if (task == thrower) throw std::runtime_error("task " + std::to_string(task));
+            });
+        } catch (const std::runtime_error& e) {
+            caught = std::string(e.what()) == "task " + std::to_string(thrower);
+        }
+        assert(caught && "run() must rethrow the task's exception");
+        std::vector<int> hits(4, 0);
+        pool.run([&](unsigned task, unsigned) { ++hits[task]; });
+        for (int hit : hits) assert(hit == 1 && "pool must stay usable after an exception");
+    }
+    // Every task throws at once: exactly one exception reaches the caller.
+    int caught = 0;
+    try {
+        pool.run([](unsigned task, unsigned) { throw std::runtime_error(std::to_string(task)); });
+    } catch (const std::runtime_error&) {
+        ++caught;
+    }
+    assert(caught == 1 && "concurrent throws must surface as one exception");
+    std::vector<int> hits(4, 0);
+    pool.run([&](unsigned task, unsigned) { ++hits[task]; });
+    for (int hit : hits) assert(hit == 1 && "pool must stay usable after concurrent throws");
+    std::cout << "PASSED\n";
+}
+
+// Workers and caller asleep on the futex between runs must be woken exactly once each:
+// a lost wake-up hangs here (CTest times out), a spurious one double-counts.
+void testWakeAfterSleep() {
+    std::cout << "testWakeAfterSleep... ";
+    ForkJoinPool pool(4);
+    std::vector<int> hits(4, 0);
+    for (int r = 1; r <= 20; ++r) {
+        std::this_thread::sleep_for(kIdle);
+        // Task 0 (the caller) is the slow one, so the caller must also sleep while waiting.
+        pool.run([&](unsigned task, unsigned) {
+            if (task == 0 && r % 2) std::this_thread::sleep_for(kIdle);
+            ++hits[task];
+        });
+        for (int hit : hits) assert(hit == r && "a task was lost or repeated after a sleep");
+    }
+    std::cout << "PASSED\n";
+}
+
+// Destruction must wake and join workers whether they never ran, are spinning, or are
+// asleep. A worker that is not woken makes the destructor hang.
+void testShutdown() {
+    std::cout << "testShutdown... ";
+    { ForkJoinPool fresh(4); }
+    { ForkJoinPool spinning(4); spinning.run([](unsigned, unsigned) {}); }
+    {
+        ForkJoinPool sleeping(4);
+        sleeping.run([](unsigned, unsigned) {});
+        std::this_thread::sleep_for(kIdle);
+    }
+    { ForkJoinPool partial(4); partial.run(2u, [](unsigned, unsigned) {}); }  // workers 2, 3 never ran
+    std::cout << "PASSED\n";
+}
+
+// chunk() splits [0, count) into contiguous, disjoint slices whose sizes differ by at most 1.
+void testChunkPartition() {
+    std::cout << "testChunkPartition... ";
+    for (std::size_t count = 0; count <= 64; ++count)
+        for (unsigned tasks = 1; tasks <= 9; ++tasks) {
+            std::size_t next = 0, smallest = count, largest = 0;
+            for (unsigned t = 0; t < tasks; ++t) {
+                const auto [begin, end] = detail::chunk(count, t, tasks);
+                assert(begin == next && end >= begin && "slices must be contiguous and in order");
+                smallest = std::min(smallest, end - begin);
+                largest = std::max(largest, end - begin);
+                next = end;
+            }
+            assert(next == count && "slices must cover [0, count)");
+            assert(largest - smallest <= 1 && "slices must be balanced");
+        }
+    std::cout << "PASSED\n";
+}
+
+// taskCount() stays serial below kMinWorkPerTask and never exceeds the pool or max_tasks.
+void testTaskCount() {
+    std::cout << "testTaskCount... ";
+    ForkJoinPool pool(8);
+    const auto grain = detail::kMinWorkPerTask;
+    assert(detail::taskCount(pool, 0, 100) == 1 && "no work runs serially");
+    assert(detail::taskCount(pool, grain - 1, 100) == 1 && "work below one grain runs serially");
+    assert(detail::taskCount(pool, 3*grain, 100) == 3 && "one task per grain of work");
+    assert(detail::taskCount(pool, 100*grain, 100) == 8 && "capped at the pool size");
+    assert(detail::taskCount(pool, 100*grain, 5) == 5 && "capped at the number of owners");
+    assert(detail::saturatingProduct(~std::size_t(0), 2) == ~std::size_t(0) && "work estimate saturates");
+    std::cout << "PASSED\n";
+}
+
+// parallel_for writes every index exactly once, the caller sees all of the writes, and the
+// result does not depend on the thread count (serial, split, or a busy pool's fallback).
+void testParallelFor() {
+    std::cout << "testParallelFor... ";
+    constexpr std::size_t n = 1 << 20;
+    auto fill = [&](ForkJoinPool& pool, std::size_t work_per_item) {
+        std::vector<float> out(n, -1.f);
+        std::vector<unsigned char> writes(n, 0);
+        detail::parallel_for(pool, n, work_per_item, [&](std::size_t i) {
+            ++writes[i];
+            out[i] = static_cast<float>(i % 1000) * 0.5f;
+        });
+        assert(std::all_of(writes.begin(), writes.end(), [](auto w) { return w == 1; }) &&
+               "each index must be written exactly once");
+        return out;
+    };
+    ForkJoinPool one(1), four(4), seven(7);
+    const auto serial = fill(one, 1);
+    assert(fill(four, 1) == serial && fill(seven, 64) == serial && "thread count changed the result");
+    std::vector<float> nested;
+    // Inside a 4-task run the pool is owned, so the inner parallel_for takes the serial fallback.
+    four.run([&](unsigned task, unsigned) { if (task == 0) nested = fill(four, 64); });
+    assert(nested == serial && "fallback inside a run changed the result");
+    std::size_t calls = 0;
+    detail::parallel_for(four, 0, 1, [&](std::size_t) { ++calls; });
+    assert(calls == 0 && "an empty range runs nothing");
+    std::cout << "PASSED\n";
+}
+
+// run(k, f) with k < size() uses only workers 1..k-1. Alternating k leaves some workers
+// idle for many runs; they must still pick up their next ticket exactly once.
+void testPartialRuns() {
+    std::cout << "testPartialRuns... ";
+    ForkJoinPool pool(6);
+    std::vector<long> hits(6, 0), expected(6, 0);
+    for (int r = 0; r < FJP_TEST_RUNS; ++r) {
+        const unsigned k = 1 + (r * 7) % 6;
+        pool.run(k, [&](unsigned task, unsigned tasks) {
+            assert(tasks == k && task < k && "task outside the requested range");
+            ++hits[task];
+        });
+        for (unsigned t = 0; t < k; ++t) ++expected[t];
+        assert(hits == expected && "partial run skipped or repeated a task");
+    }
+    std::cout << "PASSED\n";
+}
+
+void testRejectsBadCounts() {
+    std::cout << "testRejectsBadCounts... ";
+    bool zeroPool = false, zeroTasks = false, tooMany = false;
+    try { ForkJoinPool pool(0); } catch (const std::invalid_argument&) { zeroPool = true; }
+    ForkJoinPool pool(2);
+    try { pool.run(0u, [](unsigned, unsigned) {}); } catch (const std::invalid_argument&) { zeroTasks = true; }
+    try { pool.run(3u, [](unsigned, unsigned) {}); } catch (const std::invalid_argument&) { tooMany = true; }
+    assert(zeroPool && zeroTasks && tooMany && "pool and task counts must be in range");
+    std::cout << "PASSED\n";
+}
+
+int main() {
+    testEachTaskOncePerRun();
+    testNestedRunIsSerial();
+    testConcurrentCallers();
+    testExceptionsPropagate();
+    testPartialRuns();
+    testWakeAfterSleep();
+    testShutdown();
+    testRejectsBadCounts();
+    testChunkPartition();
+    testTaskCount();
+    testParallelFor();
+    std::cout << "\nAll ForkJoinPool tests PASSED.\n";
+}

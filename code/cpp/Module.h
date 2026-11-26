@@ -19,7 +19,7 @@ public:
 
 class Layer final : public Module {
 public:
-    Layer(ndp::ThreadPool& pool, std::size_t nin, std::size_t nout,
+    Layer(ndp::ForkJoinPool& pool, std::size_t nin, std::size_t nout,
           Activation activation, std::mt19937& rng);
     Layer(BasicTensor weights, BasicTensor bias, std::vector<Activation> activations);
 
@@ -37,14 +37,14 @@ private:
 class MLP final : public Module {
 public:
     // He-initialized dense layers, ReLU hidden activations and configurable output.
-    MLP(ndp::ThreadPool& pool, std::size_t nin, const Shape& widths,
+    MLP(ndp::ForkJoinPool& pool, std::size_t nin, const Shape& widths,
         Activation output = Activation::Linear, std::uint32_t seed = 42);
     BasicTensor forward(const BasicTensor& x) const override;
     std::vector<BasicTensor> parameters() const override;
     const std::vector<Layer>& layers() const { return layers_; }
     // Publishes a new checkpoint. Existing files are preserved.
     void save(const std::filesystem::path& path) const;
-    static MLP load(ndp::ThreadPool& pool, const std::filesystem::path& path);
+    static MLP load(ndp::ForkJoinPool& pool, const std::filesystem::path& path);
 
 private:
     explicit MLP(std::vector<Layer> layers) : layers_(std::move(layers)) {}

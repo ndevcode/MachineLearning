@@ -24,7 +24,7 @@ template<class Function> void rejects(Function run) {
     throw std::runtime_error("invalid operation succeeded");
 }
 
-void shared_graph(ndp::ThreadPool& pool) {
+void shared_graph(ndp::ForkJoinPool& pool) {
     BasicTensor x(pool, 2), y(pool, 3);
     auto product = x*y;
     auto loss = product*product + product + x.pow(0);
@@ -42,7 +42,7 @@ void shared_graph(ndp::ThreadPool& pool) {
     rejects([&] { BasicTensor bad(pool, {1, 2}, {1}); });
 }
 
-void broadcast_and_reduce(ndp::ThreadPool& pool) {
+void broadcast_and_reduce(ndp::ForkJoinPool& pool) {
     BasicTensor a(pool, {2,1,2}, {1,2,3,4});
     BasicTensor b(pool, {3,1}, {2,3,4});
     auto z = a*b;
@@ -57,7 +57,7 @@ void broadcast_and_reduce(ndp::ThreadPool& pool) {
     rejects([&] { a + BasicTensor(pool, {3}, {1,2,3}); });
 }
 
-void matmul_vectors(ndp::ThreadPool& pool) {
+void matmul_vectors(ndp::ForkJoinPool& pool) {
     BasicTensor v(pool, {2}, {2,3}), w(pool, {2}, {5,7});
     auto dot = v.matmul(w);
     check(dot.shape().empty(), "dot shape");
@@ -72,7 +72,7 @@ void matmul_vectors(ndp::ThreadPool& pool) {
 }
 
 // Finite differences of every input, weight and bias in a batched dense layer.
-void numerical_gradients(ndp::ThreadPool& pool) {
+void numerical_gradients(ndp::ForkJoinPool& pool) {
     std::vector<Values> data{{1,2,3,0.5f,1.5f,2.5f}, {1,0,-1,0.3f,0.2f,0.1f}, {2.5f,0.7f}};
     auto tensors = [&] {
         return std::vector<BasicTensor>{{pool, {2,3}, data[0]}, {pool, {2,3}, data[1]}, {pool, {2}, data[2]}};
@@ -104,7 +104,40 @@ void numerical_gradients(ndp::ThreadPool& pool) {
     check(logits.grad() == Values{0.5f,-0.5f,-0.25f,0.25f}, "stable softmax gradient");
 }
 
-std::vector<Values> training_step(ndp::ThreadPool& pool) {
+// The fused dense node against the unfused composition of independently tested ops,
+// for a vector, a small batch, and a batch large enough to split across threads.
+void dense_matches_composition(ndp::ForkJoinPool& pool) {
+    const Activation cycle[]{Activation::ReLU, Activation::Sigmoid, Activation::Linear};
+    for (Shape xs : {Shape{5}, Shape{3,5}, Shape{67,300}}) {
+        const std::size_t in = xs.back(), out = in == 5 ? 4 : 90;
+        const std::size_t rows = xs.size() == 2 ? xs[0] : 1;
+        std::vector<Activation> acts(out);
+        for (std::size_t j = 0; j < out; ++j) acts[j] = cycle[j % 3];
+        auto fill = [](std::size_t n, float phase) {
+            Values v(n);
+            for (std::size_t i = 0; i < n; ++i) v[i] = std::sin(0.7f*float(i) + phase);
+            return v;
+        };
+        Values xv = fill(rows*in, 0), wv = fill(out*in, 1), bv = fill(out, 2), cv = fill(rows*out, 3);
+        Shape ys = xs.size() == 2 ? Shape{rows, out} : Shape{out};
+        auto run = [&](bool fused) {
+            BasicTensor x(pool, xs, xv), w(pool, {out, in}, wv), b(pool, {out}, bv);
+            auto y = fused ? x.dense(w, b, acts) : (x.matmul(w.T()) + b).activate(acts);
+            (y * BasicTensor(pool, ys, cv)).sum().backward();  // non-uniform dY
+            return std::vector<Values>{y.value(), x.grad(), w.grad(), b.grad()};
+        };
+        auto fused = run(true), reference = run(false);
+        for (std::size_t t = 0; t < fused.size(); ++t)
+            for (std::size_t i = 0; i < fused[t].size(); ++i)
+                near(fused[t][i], reference[t][i], 1e-5f * (1 + std::abs(reference[t][i])));
+    }
+    BasicTensor x(pool, {2,3}, {1,2,3,4,5,6}), w(pool, {2,3}, {1,1,1,1,1,1}), b(pool, {2}, {0,0});
+    rejects([&] { x.dense(w, b, {Activation::ReLU}); });
+    rejects([&] { x.dense(w.T(), b, {Activation::ReLU, Activation::ReLU}); });
+    rejects([&] { w.dense(w, b, {Activation::ReLU, Activation::ReLU}); });
+}
+
+std::vector<Values> training_step(ndp::ForkJoinPool& pool) {
     MLP model(pool, 69, {80,10});
     Values data(65*69);
     for (std::size_t i = 0; i < data.size(); ++i) data[i] = std::sin(float(i));
@@ -124,7 +157,7 @@ std::vector<Values> training_step(ndp::ThreadPool& pool) {
     return results;
 }
 
-void checkpoint(ndp::ThreadPool& pool, const fs::path& dir) {
+void checkpoint(ndp::ForkJoinPool& pool, const fs::path& dir) {
     // Original Network format. Mixed activation types and interleaved biases.
     fs::path fixture = dir/"legacy.dat", saved = dir/"saved.dat";
     {
@@ -153,12 +186,16 @@ void checkpoint(ndp::ThreadPool& pool, const fs::path& dir) {
 int main() {
     fs::path temp;
     try {
-        ndp::ThreadPool single(1), multi(4);
+        ndp::ForkJoinPool single(1), odd(3), multi(4);
         shared_graph(multi);
         broadcast_and_reduce(multi);
         matmul_vectors(multi);
         numerical_gradients(multi);
-        check(training_step(single) == training_step(multi), "worker count changed training results");
+        dense_matches_composition(single);
+        dense_matches_composition(multi);
+        const auto serial = training_step(single);
+        check(serial == training_step(odd) && serial == training_step(multi),
+              "thread count changed training results");
         for (unsigned i = 0; ; ++i) {
             auto candidate = fs::temp_directory_path()/("cpu-autograd-test-" + std::to_string(i));
             if (fs::create_directory(candidate)) { temp = candidate; break; }

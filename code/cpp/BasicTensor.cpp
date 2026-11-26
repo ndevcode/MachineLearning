@@ -5,6 +5,7 @@
 #include <cmath>
 #include <numeric>
 #include <stdexcept>
+#include <string>
 #include <unordered_set>
 #include <utility>
 
@@ -54,10 +55,40 @@ float sigmoid_value(float x) {
     return x >= 0 ? 1 / (1 + e) : e / (1 + e);
 }
 
+float activation_value(Activation a, float x) {
+    if (a == Activation::Sigmoid) return sigmoid_value(x);
+    return a == Activation::ReLU ? std::max(0.f, x) : x;
+}
+
+// Derivative written in terms of the output y, so the pre-activation need not be kept.
+// ReLU: y > 0 exactly when x > 0.
+float activation_slope(Activation a, float y) {
+    if (a == Activation::Sigmoid) return y * (1 - y);
+    return a == Activation::ReLU ? float(y > 0) : 1.f;
+}
+
+std::string to_string(const Shape& shape) {
+    std::string s = "{";
+    for (std::size_t i = 0; i < shape.size(); ++i) s += (i ? ", " : "") + std::to_string(shape[i]);
+    return s + "}";
+}
+
+// Visits the flat range [begin, end) of a row-major matrix with `width` columns as
+// row segments: visit(row, first_column, end_column).
+template<class Visit>
+void row_segments(std::size_t begin, std::size_t end, std::size_t width, Visit visit) {
+    while (begin < end) {
+        const std::size_t row = begin / width, first = begin % width;
+        const std::size_t last = std::min(width, first + (end - begin));
+        visit(row, first, last);
+        begin += last - first;
+    }
+}
+
 } // namespace
 
 struct BasicTensor::Node {
-    ndp::ThreadPool& pool;
+    ndp::ForkJoinPool& pool;
     Shape shape;
     Values value, grad;
     std::vector<Ptr> parents;
@@ -65,19 +96,19 @@ struct BasicTensor::Node {
     Backward backward;
     std::size_t version = 0;
 
-    Node(ndp::ThreadPool& p, Shape s, Values v)
+    Node(ndp::ForkJoinPool& p, Shape s, Values v)
         : pool(p), shape(std::move(s)), value(std::move(v)), grad(value.size(), 0) {
         if (elements(shape) != value.size()) throw std::invalid_argument("tensor size mismatch");
     }
 };
 
-BasicTensor::BasicTensor(ndp::ThreadPool& p, Shape s, Values v)
+BasicTensor::BasicTensor(ndp::ForkJoinPool& p, Shape s, Values v)
     : node_(std::make_shared<Node>(p, std::move(s), std::move(v))) {}
-BasicTensor::BasicTensor(ndp::ThreadPool& p, float x) : BasicTensor(p, {}, {x}) {}
+BasicTensor::BasicTensor(ndp::ForkJoinPool& p, float x) : BasicTensor(p, {}, {x}) {}
 const Shape& BasicTensor::shape() const { return node_->shape; }
 const Values& BasicTensor::value() const { return node_->value; }
 const Values& BasicTensor::grad() const { return node_->grad; }
-ndp::ThreadPool& BasicTensor::pool() const { return node_->pool; }
+ndp::ForkJoinPool& BasicTensor::pool() const { return node_->pool; }
 
 BasicTensor BasicTensor::result(Shape shape, Values values, std::vector<Ptr> parents,
                                 Backward backward) const {
@@ -183,15 +214,10 @@ BasicTensor BasicTensor::activate(const std::vector<Activation>& columns) const 
             case Activation::Sigmoid: return sigmoid();
         }
     }
-    return unary([&](float x, auto i) {
-        auto a = columns[i % columns.size()];
-        if (a == Activation::Sigmoid) return sigmoid_value(x);
-        return a == Activation::ReLU ? std::max(0.f, x) : x;
-    }, [columns](float x, float y, auto i) {
-        auto a = columns[i % columns.size()];
-        if (a == Activation::Sigmoid) return y * (1-y);
-        return a == Activation::ReLU ? float(x > 0) : 1.f;
-    });
+    return unary([&](float x, auto i) { return activation_value(columns[i % columns.size()], x); },
+                 [columns](float, float y, auto i) {
+                     return activation_slope(columns[i % columns.size()], y);
+                 });
 }
 
 BasicTensor BasicTensor::matmul(const BasicTensor& rhs) const {
@@ -229,6 +255,88 @@ BasicTensor BasicTensor::matmul(const BasicTensor& rhs) const {
             for (std::size_t row = 0; row < m; ++row)
                 sum += left.value[row*k+inner] * out.grad[row*n+col];
             right.grad[i] += sum;
+        });
+    });
+}
+
+BasicTensor BasicTensor::dense(const BasicTensor& weights, const BasicTensor& bias,
+                               const std::vector<Activation>& activations) const {
+    const Shape& xs = shape();
+    const Shape& ws = weights.shape();
+    if (&pool() != &weights.pool() || &pool() != &bias.pool())
+        throw std::invalid_argument("dense: x, weights and bias must share one pool");
+    if (xs.empty() || xs.size() > 2 || ws.size() != 2 || xs.back() != ws[1] ||
+        bias.shape() != Shape{ws[0]} || activations.size() != ws[0])
+        throw std::invalid_argument("dense: expected x {in} or {batch, in}, weights {out, in}, bias {out} "
+            "and out activations; got x " + to_string(xs) + ", weights " + to_string(ws) + ", bias " +
+            to_string(bias.shape()) + ", " + std::to_string(activations.size()) + " activations");
+    // Backward writes dX and dW in the same pass; that is race-free only if they are different arrays.
+    if (node_ == weights.node_ || node_ == bias.node_)
+        throw std::invalid_argument("dense: x must not be the weights or bias tensor");
+
+    const std::size_t rows = xs.size() == 2 ? xs[0] : 1, in = ws[1], out = ws[0];
+    Shape dims = xs.size() == 2 ? Shape{rows, out} : Shape{out};
+    Values y(rows*out);
+    const float* X = value().data();
+    const float* W = weights.value().data();
+    const float* B = bias.value().data();
+
+    // Forward: y[r, j] = act_j(x[r, :] . W[j, :] + b[j]). Both rows are contiguous, and the
+    // task that owns flat index r*out + j is the only writer of y[r, j].
+    detail::parallel_for(pool(), y.size(), in, [&](std::size_t i) {
+        const std::size_t r = i / out, j = i % out;
+        const float* xr = X + r*in;
+        const float* wj = W + j*in;
+        float z = 0;
+        for (std::size_t k = 0; k < in; ++k) z += xr[k] * wj[k];
+        y[i] = activation_value(activations[j], z + B[j]);
+    });
+
+    return result(std::move(dims), std::move(y), {node_, weights.node_, bias.node_},
+                  [rows, in, out, acts = activations](const Node& node) {
+        Node& x = *node.parents[0];
+        Node& w = *node.parents[1];
+        Node& b = *node.parents[2];
+        // dZ[r, j] = act_j'(y[r, j]) dY[r, j], recomputed where used instead of stored,
+        // so the whole backward is one pass with one barrier at the end.
+        auto dz = [&](std::size_t r, std::size_t j) {
+            const std::size_t i = r*out + j;
+            return activation_slope(acts[j], node.value[i]) * node.grad[i];
+        };
+        // Each task owns one slice of W's out*in elements (dW, plus db[j] for the slice
+        // holding column 0 of row j) and one slice of x's rows*in elements (dX). The
+        // slices are disjoint, so the three products are written without a lock.
+        const unsigned tasks = detail::taskCount(
+            node.pool, detail::saturatingProduct(2*rows*out, in), std::max(out, rows)*in);
+        detail::runTasks(node.pool, tasks, [&](unsigned t) {
+            std::vector<float> acc(in);
+
+            // Step 1: dW[j, k] += sum_r dZ[r, j] x[r, k]; db[j] += sum_r dZ[r, j].
+            const auto [w_begin, w_end] = detail::chunk(out*in, t, tasks);
+            row_segments(w_begin, w_end, in, [&](std::size_t j, std::size_t k0, std::size_t k1) {
+                std::fill(acc.begin(), acc.begin() + (k1 - k0), 0.f);
+                float bias_sum = 0;
+                for (std::size_t r = 0; r < rows; ++r) {
+                    const float g = dz(r, j);
+                    const float* xr = x.value.data() + r*in;
+                    for (std::size_t k = k0; k < k1; ++k) acc[k - k0] += g * xr[k];
+                    bias_sum += g;
+                }
+                for (std::size_t k = k0; k < k1; ++k) w.grad[j*in + k] += acc[k - k0];
+                if (k0 == 0) b.grad[j] += bias_sum;
+            });
+
+            // Step 2: dX[r, k] += sum_j dZ[r, j] W[j, k].
+            const auto [x_begin, x_end] = detail::chunk(rows*in, t, tasks);
+            row_segments(x_begin, x_end, in, [&](std::size_t r, std::size_t k0, std::size_t k1) {
+                std::fill(acc.begin(), acc.begin() + (k1 - k0), 0.f);
+                for (std::size_t j = 0; j < out; ++j) {
+                    const float g = dz(r, j);
+                    const float* wj = w.value.data() + j*in;
+                    for (std::size_t k = k0; k < k1; ++k) acc[k - k0] += g * wj[k];
+                }
+                for (std::size_t k = k0; k < k1; ++k) x.grad[r*in + k] += acc[k - k0];
+            });
         });
     });
 }

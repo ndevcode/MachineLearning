@@ -1,49 +1,55 @@
 #pragma once
 
-#include "base/ThreadPool.h"
+#include "base/ForkJoinPool.h"
+
 #include <algorithm>
-#include <future>
+#include <cstddef>
+#include <limits>
 
 namespace ml::detail {
 
-class RangeJob final : public ndp::ThreadJob {
-public:
-    explicit RangeJob(std::packaged_task<void()> task) : task_(std::move(task)) {}
-    void execute() override { task_(); }
-private:
-    std::packaged_task<void()> task_;
-};
+// Smallest amount of work (multiply-adds or element operations) worth one more
+// thread. Below it a dispatch costs more than the loop it splits.
+constexpr std::size_t kMinWorkPerTask = 1u << 14;
 
-// Each iteration owns its destination. Keep tiny loops local and wait for
-// only this kernel's tasks, so independent graphs can share a pool.
+// Tasks worth running for total_work units spread over at most max_tasks owners.
+inline unsigned taskCount(const ndp::ForkJoinPool& pool, std::size_t total_work,
+                          std::size_t max_tasks) {
+    const std::size_t useful = std::max<std::size_t>(1, total_work / kMinWorkPerTask);
+    return static_cast<unsigned>(std::min({useful, max_tasks, std::size_t(pool.size())}));
+}
+
+inline std::size_t saturatingProduct(std::size_t a, std::size_t b) {
+    return b && a > std::numeric_limits<std::size_t>::max() / b
+        ? std::numeric_limits<std::size_t>::max() : a * b;
+}
+
+// Task t's slice [begin, end) of count items split as evenly as possible over tasks.
+// The slices are disjoint and cover [0, count), so each index has exactly one owner.
+struct Range { std::size_t begin, end; };
+inline Range chunk(std::size_t count, unsigned task, unsigned tasks) {
+    const std::size_t base = count / tasks, extra = count % tasks;
+    const std::size_t begin = task*base + std::min<std::size_t>(task, extra);
+    return {begin, begin + base + (task < extra)};
+}
+
+// Runs task(t) for t in [0, tasks) on the pool. Only tasks - 1 workers are signalled.
+template<class Task>
+void runTasks(ndp::ForkJoinPool& pool, unsigned tasks, Task task) {
+    pool.run(tasks, [&](unsigned t, unsigned) { task(t); });
+}
+
+// run(i) for every i in [0, count). Each i must write only outputs that i owns: then no
+// lock is needed and the result is the same for every thread count.
 template<class Function>
-void parallel_for(ndp::ThreadPool& pool, std::size_t count, std::size_t work_per_item,
+void parallel_for(ndp::ForkJoinPool& pool, std::size_t count, std::size_t work_per_item,
                   Function run) {
-    const auto grain = std::max<std::size_t>(1, 4096 / work_per_item);
-    const auto tasks = count ? std::min(pool.workerCount(), 1 + (count - 1) / grain) : 0;
-    if (tasks <= 1 || pool.onWorkerThread()) {
-        for (std::size_t i = 0; i < count; ++i) run(i);
-        return;
-    }
-    std::vector<std::future<void>> done;
-    done.reserve(tasks);
-    try {
-        std::size_t begin = 0;
-        for (std::size_t t = 0; t < tasks; ++t) {
-            const auto end = begin + count / tasks + (t < count % tasks);
-            std::packaged_task<void()> task([&run, begin, end] {
-                for (auto i = begin; i < end; ++i) run(i);
-            });
-            auto future = task.get_future();
-            pool.queueJob(std::make_unique<RangeJob>(std::move(task)));
-            done.push_back(std::move(future));
-            begin = end;
-        }
-        for (auto& f : done) f.get();
-    } catch (...) {
-        for (auto& f : done) if (f.valid()) f.wait();
-        throw;
-    }
+    if (!count) return;
+    const unsigned tasks = taskCount(pool, saturatingProduct(count, work_per_item), count);
+    runTasks(pool, tasks, [&](unsigned t) {
+        const auto [begin, end] = chunk(count, t, tasks);
+        for (auto i = begin; i < end; ++i) run(i);
+    });
 }
 
 } // namespace ml::detail

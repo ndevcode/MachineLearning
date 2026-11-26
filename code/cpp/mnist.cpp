@@ -57,7 +57,7 @@ struct Dataset {
         return data;
     }
 
-    BasicTensor batch(ndp::ThreadPool& pool, std::size_t first, std::size_t n, std::mt19937* rng) const {
+    BasicTensor batch(ndp::ForkJoinPool& pool, std::size_t first, std::size_t n, std::mt19937* rng) const {
         auto area = height*width;
         Values values(n*area);
         std::uniform_int_distribution<int> offset(-1, 1);
@@ -80,7 +80,7 @@ struct Dataset {
     }
 };
 
-void train(ndp::ThreadPool& pool, const Dataset& data, const fs::path& checkpoint,
+void train(ndp::ForkJoinPool& pool, const Dataset& data, const fs::path& checkpoint,
            std::size_t epochs, std::size_t batch_size) {
     MLP model(pool, data.width*data.height, {16, 8, 16, 10}, ml::Activation::Sigmoid);
     std::mt19937 rng(42);
@@ -107,7 +107,7 @@ void train(ndp::ThreadPool& pool, const Dataset& data, const fs::path& checkpoin
     model.save(checkpoint);
 }
 
-void evaluate(ndp::ThreadPool& pool, const Dataset& data, const MLP& model) {
+void evaluate(ndp::ForkJoinPool& pool, const Dataset& data, const MLP& model) {
     if (model.layers().front().weights().shape()[1] != data.height*data.width ||
         model.layers().back().bias().value().size() != 10)
         throw std::runtime_error("checkpoint dimensions do not match MNIST");
@@ -144,7 +144,7 @@ int main(int argc, char** argv) {
         fs::path model = argc > 2 ? fs::path(argv[2]) : dir / "improved_network.dat";
         auto epochs = argc > 3 ? positive(argv[3]) : 25;
         auto batch = argc > 4 ? positive(argv[4]) : 1;
-        ndp::ThreadPool pool(argc > 5 ? positive(argv[5]) : std::max(1u, std::thread::hardware_concurrency()));
+        ndp::ForkJoinPool pool(argc > 5 ? positive(argv[5]) : std::max(1u, std::thread::hardware_concurrency()));
         if (!fs::exists(model)) train(pool, Dataset::load(dir, "train"), model, epochs, batch);
         evaluate(pool, Dataset::load(dir, "t10k"), MLP::load(pool, model));
     } catch (const std::exception& e) {
