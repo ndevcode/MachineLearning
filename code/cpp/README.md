@@ -36,6 +36,8 @@ Tensor copies share the same graph node. `backward()` seeds each output element 
 
 Leaf tensors default to `Grad::Required`. Create input data and targets with `Grad::None`. An operation's result needs a gradient only when one of its operands does, and backward skips the work for operands that need none; for the first layer, that is half of the backward pass. While a `NoGradGuard` is alive on a thread, operations record no graph and allocate no gradient buffers. `grad()`, `zeroGrad()`, `step()` and `backward()` throw on a tensor that needs no gradient.
 
+A `Layer` can mix trainable and frozen (`Grad::None`) parameters. `Module::step()` and `Module::zeroGrad()` skip the frozen ones. A trainable parameter must be a leaf, and `Layer` rejects one that isn't at construction. Both calls check every parameter and the learning rate before changing any, so a throw leaves all parameters as they were.
+
 Errors fail loudly, naming the element; nothing is padded with an epsilon. These throw `std::domain_error`:
 
 - division by zero;
@@ -44,13 +46,13 @@ Errors fail loudly, naming the element; nothing is padded with an epsilon. These
 - `pow` at zero with a negative exponent;
 - `pow` at zero with 0 < p < 1, when a gradient is needed (the slope is infinite).
 
-`exp` and `pow` results that overflow float throw `std::overflow_error`. Shape errors throw `std::invalid_argument` naming the shapes, for example `matmul: expected {m, k} or {k} times {k, n} or {k}; got {2, 3} x {2, 3}`.
+`exp` and `pow` results that overflow float throw `std::overflow_error`. Intermediates that could overflow while the result fits are kept in double: the divisor's gradient `-g·a/d²` (`d²` leaves float range for |d| below 1e-19 or above 2e19), and `mean`, which divides the double sum before rounding, so the mean of two `FLT_MAX` is `FLT_MAX`. Shape errors throw `std::invalid_argument` naming the shapes, for example `matmul: expected {m, k} or {k} times {k, n} or {k}; got {2, 3} x {2, 3}`.
 
 Elementwise operations support trailing-axis broadcasting. Matrix multiplication accepts vectors and matrices. The library also provides `transpose`, sum by axis, mean, powers, log, exp, ReLU, sigmoid, mean softmax cross-entropy on logits (`crossEntropy`), and `dense`, a whole layer as one graph node.
 
 ### Data-parallel training
 
-`MLP::backwardSharded(x, shards, loss)` splits the batch into `shards` row blocks. It runs each block's whole forward and backward as one task, on its own copy of the parameters. It then adds the block gradients to the parameters in block order. That is one parallel call per step, and the result depends on `shards` but not on the thread count. `loss(output, first, rows)` returns the mean loss of its block and must be safe to call from several threads.
+`MLP::backwardSharded(x, shards, loss)` splits the batch into `shards` row blocks. It runs each block's whole forward and backward as one task, on its own copy of the parameters. It then adds the block gradients to the parameters in block order. That is one parallel call per step, and the result depends on `shards` but not on the thread count. `loss(output, first, rows)` returns the mean loss of its block and must be safe to call from several threads. If `x` requires a gradient, each block's input gradient goes to its rows of `x.grad()`, as with `backward()`. Such an `x` must be a leaf, because the gradient cannot continue into the graph that built it; a non-leaf `x` is rejected before any work. Gradients are accumulated only after every block succeeds.
 
 On the i7-13650HX the two strategies split as follows (time per SGD step, 16 shards):
 
@@ -90,8 +92,10 @@ Broadcasting, `transpose` and `sum` backward walk index ranges with an odometer,
 
 - broadcasting, `matmul`, `transpose` and `sum` against naive reference loops;
 - `dense` against the unfused ops, and gradients against finite differences;
-- `backwardSharded` against a single graph;
-- the domain and overflow errors, a 400,000-node teardown, and the no-aliasing rule;
+- `backwardSharded` against a single graph, including the input gradient;
+- frozen parameters, and that a failed `step()` or `zeroGrad()` changes nothing;
+- the domain and overflow errors, division and `mean` at extreme magnitudes, a 400,000-node teardown, and the no-aliasing rule;
+- that saving never replaces an existing file or a dangling symlink;
 - bitwise identical results across 1, 3 and 4 threads.
 
 ## MNIST
@@ -106,7 +110,7 @@ The example trains hidden layers of 16, 8, and 16 ReLU units with ten sigmoid ou
 
 An existing checkpoint goes straight to test-set evaluation, with a note on stderr. If EPOCHS or BATCH_SIZE is given as well, the program fails rather than silently ignore them.
 
-The checkpoint layout matches the supplied sequential model's files: 32-bit counts, per-neuron activation bytes, and float weights with each bias following its neuron's weights. It is little-endian, the byte order of the x86 machines that wrote those files, and big-endian hosts byte-swap. A library MLP with linear outputs uses the additional activation code 2. Saving publishes a completed file through a hard link in the destination directory and never overwrites an existing one. On filesystems without hard links (FAT, exFAT, some network shares), it checks that the destination is absent and then renames. That rename still publishes only a complete file, but a writer that creates the destination between the check and the rename can be overwritten.
+The checkpoint layout matches the supplied sequential model's files: 32-bit counts, per-neuron activation bytes, and float weights with each bias following its neuron's weights. It is little-endian, the byte order of the x86 machines that wrote those files, and big-endian hosts byte-swap. A library MLP with linear outputs uses the additional activation code 2. Saving publishes a completed file through a hard link in the destination directory and never overwrites an existing one; it throws `filesystem_error` with `errc::file_exists` instead. On filesystems without hard links (FAT, exFAT, some network shares), Linux publishes with `renameat2(RENAME_NOREPLACE)`, which is just as atomic. Where that is unsupported too, or on other platforms, saving throws rather than risk replacing a file. The earlier check-then-rename fallback lost that race: with the fallback forced and 16 trainers saving to one path at once, two or more succeeded in 79 of 200 rounds; the no-replace rename, in none.
 
 ## License
 

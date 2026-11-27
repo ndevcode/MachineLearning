@@ -385,6 +385,7 @@ BasicTensor::BasicTensor(ndp::ForkJoinPool& p, float x, Grad g) : BasicTensor(p,
 const Shape& BasicTensor::shape() const { return node_->shape; }
 const Values& BasicTensor::value() const { return node_->value; }
 bool BasicTensor::requiresGrad() const { return node_->requiresGrad; }
+bool BasicTensor::isLeaf() const { return node_->parents.empty(); }
 ndp::ForkJoinPool& BasicTensor::pool() const { return node_->pool; }
 
 const Values& BasicTensor::grad() const {
@@ -448,8 +449,12 @@ BasicTensor BasicTensor::binary(const BasicTensor& rhs, Binary op) const {
                     else if constexpr (OP == Binary::Multiply)
                         return g * (side == 0 ? right.value[ib] : left.value[ia]);
                     else {
-                        const float d = right.value[ib];
-                        return side == 0 ? g / d : -g * left.value[ia] / (d * d);
+                        if (side == 0) return g / right.value[ib];
+                        // -g a / d², in double: d² in float underflows for |d| < 1e-19 and
+                        // overflows for |d| > 2e19 although the gradient itself may fit.
+                        // Double covers the square of every finite float.
+                        const double d = right.value[ib];
+                        return static_cast<float>(-double(g) * double(left.value[ia]) / (d * d));
                     }
                 };
                 if (map.covers(side)) {  // one output per element: output i owns dest.grad[i]
@@ -774,8 +779,19 @@ BasicTensor BasicTensor::sum(std::optional<int> axis, bool keepDims) const {
     });
 }
 
+// Its own node rather than sum() / n: the sum would round to float before the division,
+// so finite inputs whose mean fits (two FLT_MAX) overflowed, and float(n) is inexact
+// above 2^24. The total is the same double, summed in the same order, as sum()'s.
 BasicTensor BasicTensor::mean() const {
-    return sum() / static_cast<float>(value().size());
+    const double count = static_cast<double>(value().size());  // never 0: Node rejects empty shapes
+    const double total = std::accumulate(value().begin(), value().end(), 0.0);
+    return result({}, {static_cast<float>(total / count)}, {node_}, [count](const Node& out) {
+        Node& in = *out.parents[0];
+        // Equal to the old out.grad / float(n) for n <= 2^24: rounding a float quotient
+        // through double first never changes it (53 >= 2*24 + 2 bits).
+        const auto share = static_cast<float>(double(out.grad[0]) / count);
+        detail::parallelFor(out.pool, in.grad.size(), 1, [&](std::size_t i) { in.grad[i] += share; });
+    });
 }
 
 BasicTensor BasicTensor::crossEntropy(const std::vector<std::size_t>& labels) const {

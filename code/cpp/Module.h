@@ -29,6 +29,8 @@ public:
     virtual BasicTensor forward(const BasicTensor& x) const = 0;
     BasicTensor operator()(const BasicTensor& x) const { return forward(x); }
     virtual std::vector<BasicTensor> parameters() const = 0;
+    // Both skip frozen (Grad::None) parameters and require the rest to be leaves. Every
+    // parameter is checked before the first one changes, so a throw changes nothing.
     void zeroGrad();
     void step(float learningRate);
 };
@@ -70,10 +72,16 @@ public:
     // smaller). Each block runs its whole forward and backward as one task with its own
     // copy of the parameters, so a step is one parallel call. The block gradients are then
     // added to the parameters' gradients in block order, so results depend on `shards`
-    // but not on the thread count. Accumulates like backward(); returns the batch mean loss.
+    // but not on the thread count. Accumulates like backward(), into the trainable
+    // parameters and into x if x requires a gradient; returns the batch mean loss. x must
+    // then be a leaf: its gradient cannot continue into the graph that built it. Nothing
+    // is accumulated unless every shard succeeds.
     float backwardSharded(const BasicTensor& x, std::size_t shards, const ShardLoss& loss);
 
-    // Publishes a new checkpoint. Existing files are preserved.
+    // Publishes a complete checkpoint atomically and never replaces an existing file: if
+    // `path` exists, throws std::filesystem::filesystem_error with errc::file_exists. On a
+    // filesystem with neither hard links nor an atomic no-replace rename, throws instead
+    // of publishing.
     void save(const std::filesystem::path& path) const;
     static MLP load(ndp::ForkJoinPool& pool, const std::filesystem::path& path);
 

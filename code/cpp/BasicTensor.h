@@ -70,6 +70,9 @@ public:
     // Throws std::logic_error unless requiresGrad().
     const Values& grad() const;
     bool requiresGrad() const;
+    // True for a tensor with no recorded parents: built by a constructor, or by an operation
+    // that recorded no graph. Only leaves can be updated by step().
+    bool isLeaf() const;
     ndp::ForkJoinPool& pool() const;
 
     BasicTensor operator+(const BasicTensor& rhs) const;

@@ -17,6 +17,8 @@
 #include <cmath>
 #include <fstream>
 #include <iostream>
+#include <limits>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 
@@ -275,6 +277,62 @@ void domainErrors(ndp::ForkJoinPool& pool) {
     near(BasicTensor(pool, {1}, {-200}).exp().value()[0], 0);  // underflow to 0 is exact enough
 }
 
+// Results and gradients that fit in float, where a float intermediate does not: d² in the
+// divisor's gradient, and the sum before mean() divides.
+void extremeMagnitudes(ndp::ForkJoinPool& pool) {
+    for (float v : {1e-30f, 1e30f}) {
+        BasicTensor a(pool, v), d(pool, v);
+        auto q = a / d;
+        q.backward();
+        near(q.value()[0], 1);
+        const float exact = static_cast<float>(-1.0 / double(v));
+        std::ostringstream at;  // to_string would print 1e-30 as 0.000000
+        at << " at a = d = " << v << ": got " << d.grad()[0] << " and " << a.grad()[0];
+        check(std::isfinite(d.grad()[0]) && std::abs(d.grad()[0] - exact) <= 1e-6f * std::abs(exact),
+              "divisor gradient" + at.str());
+        check(std::abs(a.grad()[0] - 1/v) <= 1e-6f / v, "dividend gradient" + at.str());
+    }
+    const float big = std::numeric_limits<float>::max();
+    BasicTensor m(pool, {2}, {big, big});
+    auto mean = m.mean();
+    check(mean.value()[0] == big, "mean of {FLT_MAX, FLT_MAX} is " + std::to_string(mean.value()[0]));
+    mean.backward();
+    check(m.grad() == Values{0.5f, 0.5f}, "mean gradient");}
+
+// Frozen parameters are skipped by step() and zeroGrad(); a parameter that can't be updated
+// fails the whole call before anything changes.
+void frozenParameters(ndp::ForkJoinPool& pool) {
+    BasicTensor w(pool, {1, 1}, {2}), b(pool, {1}, {5}, Grad::None);
+    Layer layer(w, b, {Activation::Linear});
+    layer(BasicTensor(pool, {1}, {3}, Grad::None)).sum().backward();
+    layer.step(0.1f);
+    near(w.value()[0], 1.7f);
+    check(b.value() == Values{5}, "frozen bias changed");
+    layer.zeroGrad();
+    check(w.grad() == Values{0}, "zeroGrad skipped the trainable weight");
+    rejects([&] { layer.step(-1); });
+
+    // A non-leaf trainable parameter: rejected by Layer at construction, and by Module::step
+    // before it touches the leaf listed ahead of it.
+    BasicTensor leaf(pool, {1}, {1}), derived = leaf * 2.f;
+    rejectsWith<std::invalid_argument>("trainable weights of shape {1, 1} must be a leaf", [&] {
+        Layer(BasicTensor(pool, {1, 1}, {1}) * 2.f, leaf, {Activation::Linear});
+    });
+    struct Pair final : Module {
+        BasicTensor first, second;
+        Pair(BasicTensor f, BasicTensor s) : first(std::move(f)), second(std::move(s)) {}
+        BasicTensor forward(const BasicTensor& x) const override { return x; }
+        std::vector<BasicTensor> parameters() const override { return {first, second}; }
+    } pair(leaf, derived);
+    derived.backward();
+    const float before = leaf.value()[0];
+    rejectsWith<std::logic_error>("parameter 1 of shape {1} is the result of an operation",
+                                  [&] { pair.step(0.1f); });
+    check(leaf.value()[0] == before, "a failed step changed an earlier parameter");
+    rejects([&] { pair.zeroGrad(); });
+    check(leaf.grad() == Values{2}, "a failed zeroGrad changed an earlier parameter");
+}
+
 // Destroying the last handle to a long chain must not recurse once per node. 300,000
 // nodes overflowed an 8 MB stack before Node's destructor unlinked parents iteratively.
 void deepGraphTeardown(ndp::ForkJoinPool& pool) {
@@ -402,9 +460,11 @@ void gradientModes(ndp::ForkJoinPool& pool) {
 }
 
 // backwardSharded against one graph over the whole batch, and its determinism.
-std::vector<Values> shardedStep(ndp::ForkJoinPool& pool, std::size_t shards, float* lossOut) {
+// Parameter gradients, then the input gradient when x requires one.
+std::vector<Values> shardedStep(ndp::ForkJoinPool& pool, std::size_t shards, float* lossOut,
+                                Grad inputGrad = Grad::None) {
     MLP model(pool, 69, {32, 10});
-    BasicTensor x(pool, {65, 69}, wave(65*69, 0.1f), Grad::None);
+    BasicTensor x(pool, {65, 69}, wave(65*69, 0.1f), inputGrad);
     std::vector<std::size_t> labels(65);
     for (std::size_t r = 0; r < labels.size(); ++r) labels[r] = (r * 7) % 10;
     const float loss = model.backwardSharded(x, shards, [&](const BasicTensor& out, std::size_t first,
@@ -415,13 +475,14 @@ std::vector<Values> shardedStep(ndp::ForkJoinPool& pool, std::size_t shards, flo
     if (lossOut) *lossOut = loss;
     std::vector<Values> grads;
     for (const auto& p : model.parameters()) grads.push_back(p.grad());
+    if (inputGrad == Grad::Required) grads.push_back(x.grad());
     return grads;
 }
 
 void shardedTraining(ndp::ForkJoinPool& single, ndp::ForkJoinPool& odd, ndp::ForkJoinPool& multi) {
-    // Reference: the same model and batch as one graph.
+    // Reference: the same model and batch as one graph, with an input gradient.
     MLP model(single, 69, {32, 10});
-    BasicTensor x(single, {65, 69}, wave(65*69, 0.1f), Grad::None);
+    BasicTensor x(single, {65, 69}, wave(65*69, 0.1f));
     std::vector<std::size_t> labels(65);
     for (std::size_t r = 0; r < labels.size(); ++r) labels[r] = (r * 7) % 10;
     auto loss = model(x).crossEntropy(labels);
@@ -437,6 +498,23 @@ void shardedTraining(ndp::ForkJoinPool& single, ndp::ForkJoinPool& odd, ndp::For
     check(shardedStep(single, 8, nullptr) == sharded && shardedStep(odd, 8, nullptr) == sharded,
           "thread count changed sharded gradients");
     check(shardedStep(multi, 1000, nullptr).size() == params.size(), "more shards than rows");
+
+    // A leaf input that requires a gradient gets the one a single graph gives it, and the
+    // parameter gradients are those of a Grad::None input.
+    const auto withInput = shardedStep(multi, 8, nullptr, Grad::Required);
+    check(std::vector<Values>(withInput.begin(), withInput.end() - 1) == sharded,
+          "an input gradient changed sharded parameter gradients");
+    nearAll(withInput.back(), x.grad(), 1e-5f, "sharded input gradient");
+    check(shardedStep(odd, 8, nullptr, Grad::Required) == withInput, "thread count changed the input gradient");
+    // A non-leaf input would need its gradient to continue upstream; rejected before any work.
+    MLP untouched(multi, 69, {10});
+    BasicTensor leafInput(multi, {65, 69}, wave(65*69, 0.1f));
+    rejectsWith<std::logic_error>("is the result of an operation", [&] {
+        untouched.backwardSharded(leafInput * 1.f, 4,
+                                  [](const BasicTensor& out, std::size_t, std::size_t) { return out.sum(); });
+    });
+    for (const auto& p : untouched.parameters())
+        for (float g : p.grad()) check(g == 0, "a rejected backwardSharded accumulated a gradient");
 
     MLP small(multi, 69, {10});
     BasicTensor wrong(multi, {65, 68}, wave(65*68, 0), Grad::None);
@@ -499,7 +577,21 @@ void checkpoint(ndp::ForkJoinPool& pool, const fs::path& dir) {
         check(first[0] == 2 && first[1] == 0 && first[2] == 0 && first[3] == 0,
               "checkpoint counts are little-endian");
     }
-    rejects([&] { model.save(saved); });
+    // Never replaces what is there, even a dangling symlink (which fs::exists reports absent).
+    auto refusesExisting = [&](const fs::path& path) {
+        try {
+            model.save(path);
+        } catch (const fs::filesystem_error& e) {
+            check(e.code() == std::errc::file_exists, std::string("save over an existing file: ") + e.what());
+            return;
+        }
+        throw std::runtime_error("save replaced " + path.string());
+    };
+    refusesExisting(saved);
+    const fs::path dangling = dir/"dangling.dat";
+    fs::create_symlink(dir/"absent", dangling);
+    refusesExisting(dangling);
+    check(fs::is_symlink(dangling) && !fs::exists(dir/"absent"), "save disturbed a dangling symlink");
     fs::resize_file(saved, fs::file_size(saved) - 1);
     rejectsWith<std::runtime_error>("truncated checkpoint", [&] { MLP::load(pool, saved); });
 }
@@ -519,6 +611,8 @@ int main() {
         denseMatchesComposition(single);
         denseMatchesComposition(multi);
         domainErrors(multi);
+        extremeMagnitudes(multi);
+        frozenParameters(multi);
         deepGraphTeardown(single);
         noAliasing(multi);
         transposeAndSumMatchReference(single);

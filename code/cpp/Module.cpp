@@ -25,6 +25,12 @@
 #include <string>
 #include <system_error>
 
+#if defined(__linux__)
+#include <cerrno>
+#include <cstdio>   // renameat2, RENAME_NOREPLACE (glibc 2.28+, under _GNU_SOURCE)
+#include <fcntl.h>  // AT_FDCWD
+#endif
+
 namespace ml {
 namespace {
 
@@ -108,10 +114,50 @@ bool linksUnsupported(const std::error_code& error) {
            error == std::errc::function_not_supported;
 }
 
+// Publishes `from` at `to` only if nothing exists there, atomically. Where neither the
+// filesystem nor the platform can promise that, throws rather than risk replacing another
+// trainer's checkpoint.
+void renameNoReplace(const std::filesystem::path& from, const std::filesystem::path& to) {
+    namespace fs = std::filesystem;
+#if defined(__linux__) && defined(RENAME_NOREPLACE)
+    if (::renameat2(AT_FDCWD, from.c_str(), AT_FDCWD, to.c_str(), RENAME_NOREPLACE) == 0) return;
+    const std::error_code error(errno, std::generic_category());
+    if (error == std::errc::invalid_argument || error == std::errc::function_not_supported)
+        throw fs::filesystem_error("MLP::save: this filesystem has neither hard links nor a no-replace "
+                                   "rename, so the checkpoint cannot be published without risking "
+                                   "replacing an existing file", from, to, error);
+    throw fs::filesystem_error("MLP::save: cannot publish checkpoint", from, to, error);
+#else
+    throw fs::filesystem_error("MLP::save: this filesystem has no hard links and this platform has no "
+                               "atomic no-replace rename", from, to,
+                               std::make_error_code(std::errc::operation_not_supported));
+#endif
+}
+
+// The parameters step() and zeroGrad() act on: frozen (Grad::None) ones are skipped, the
+// rest must be leaves. All are checked before the caller changes any, so a throw leaves
+// every parameter as it was.
+std::vector<BasicTensor> trainable(const Module& module, const char* op) {
+    std::vector<BasicTensor> params = module.parameters();
+    for (std::size_t i = 0; i < params.size(); ++i)
+        if (params[i].requiresGrad() && !params[i].isLeaf())
+            throw std::logic_error(std::string(op) + ": parameter " + std::to_string(i) + " of shape " +
+                                   toString(params[i].shape()) + " is the result of an operation, "
+                                   "not a leaf");
+    std::erase_if(params, [](const BasicTensor& p) { return !p.requiresGrad(); });
+    return params;
+}
+
 } // namespace
 
-void Module::zeroGrad() { for (auto p : parameters()) p.zeroGrad(); }
-void Module::step(float learningRate) { for (auto p : parameters()) p.step(learningRate); }
+void Module::zeroGrad() { for (auto p : trainable(*this, "zeroGrad")) p.zeroGrad(); }
+
+void Module::step(float learningRate) {
+    if (!std::isfinite(learningRate) || learningRate < 0)
+        throw std::invalid_argument("step: learning rate must be finite and non-negative, got " +
+                                    std::to_string(learningRate));
+    for (auto p : trainable(*this, "step")) p.step(learningRate);
+}
 
 Layer::Layer(ndp::ForkJoinPool& pool, std::size_t nin, std::size_t nout,
              Activation activation, std::mt19937& rng)
@@ -128,6 +174,11 @@ Layer::Layer(BasicTensor weights, BasicTensor bias, std::vector<Activation> acti
                                     std::to_string(activations_.size()) + " activations");
     if (&weights_.pool() != &bias_.pool())
         throw std::invalid_argument("Layer: weights and bias belong to different pools");
+    for (const BasicTensor* p : {&weights_, &bias_})
+        if (p->requiresGrad() && !p->isLeaf())
+            throw std::invalid_argument("Layer: trainable " + std::string(p == &weights_ ? "weights" : "bias") +
+                                        " of shape " + toString(p->shape()) + " must be a leaf tensor, "
+                                        "not the result of an operation");
 }
 
 BasicTensor Layer::forward(const BasicTensor& x) const {
@@ -168,8 +219,9 @@ MLP MLP::replicate() const {
     for (const Layer& layer : layers_) {
         const BasicTensor& w = layer.weights();
         const BasicTensor& b = layer.bias();
-        copies.emplace_back(BasicTensor(w.pool(), w.shape(), w.value()),
-                            BasicTensor(b.pool(), b.shape(), b.value()), layer.activations());
+        auto grad = [](const BasicTensor& p) { return p.requiresGrad() ? Grad::Required : Grad::None; };
+        copies.emplace_back(BasicTensor(w.pool(), w.shape(), w.value(), grad(w)),
+                            BasicTensor(b.pool(), b.shape(), b.value(), grad(b)), layer.activations());
     }
     return MLP(std::move(copies));
 }
@@ -183,11 +235,27 @@ float MLP::backwardSharded(const BasicTensor& x, std::size_t shards, const Shard
                                     "}; got " + toString(x.shape()));
     if (shards == 0 || !loss)
         throw std::invalid_argument("backwardSharded: needs a positive shard count and a loss");
+    // A leaf x that needs a gradient gets one, as backward() would give it. A non-leaf x
+    // cannot: its gradient would have to continue into the graph that built it, and the
+    // shards' graphs start at copies of x.
+    const bool inputGrad = x.requiresGrad();
+    if (inputGrad && !x.isLeaf())
+        throw std::logic_error("backwardSharded: x of shape " + toString(x.shape()) + " is the result "
+                               "of an operation; gradients cannot flow back past it. Pass a leaf "
+                               "(Grad::None for data), or build one graph and call backward()");
+    auto trainableOnly = [](std::vector<BasicTensor> ps) {
+        std::erase_if(ps, [](const BasicTensor& p) { return !p.requiresGrad(); });
+        return ps;
+    };
+    auto params = trainableOnly(parameters());  // frozen parameters get no gradient
+    if (params.empty() && !inputGrad)
+        throw std::logic_error("backwardSharded: neither x nor any parameter requires a gradient");
     const std::size_t rows = x.shape()[0];
     shards = std::min(shards, rows);
     ndp::ForkJoinPool& pool = x.pool();
-    std::vector<std::vector<Values>> shardGrads(shards);  // [shard][parameter]
+    std::vector<std::vector<Values>> shardGrads(shards);  // [shard][trainable parameter]
     std::vector<double> shardLosses(shards);
+    Values inputGrads(inputGrad ? rows*inputs : 0);       // shard s owns its rows
 
     // Step 1: one task per thread, each running shards t, t + tasks, ... on its own replica,
     // so tasks share nothing they write. Operations inside a shard use whatever workers are
@@ -200,14 +268,14 @@ float MLP::backwardSharded(const BasicTensor& x, std::size_t shards, const Shard
     const auto tasks = static_cast<unsigned>(std::min<std::size_t>(pool.size(), shards));
     detail::runTasks(pool, tasks, [&](unsigned task) {
         MLP replica = replicate();
-        const auto replicaParams = replica.parameters();
+        const auto replicaParams = trainableOnly(replica.parameters());
         for (std::size_t s = task; s < shards; s += tasks) {
             const auto [first, end] =
                 detail::chunk(rows, static_cast<unsigned>(s), static_cast<unsigned>(shards));
             const std::size_t count = end - first;
             const auto begin = x.value().begin() + std::ptrdiff_t(first*inputs);
             BasicTensor slice(pool, {count, inputs}, Values(begin, begin + std::ptrdiff_t(count*inputs)),
-                              Grad::None);
+                              inputGrad ? Grad::Required : Grad::None);
             replica.zeroGrad();
             const BasicTensor shardLoss = loss(replica(slice), first, count);
             if (!shardLoss.shape().empty())
@@ -218,11 +286,16 @@ float MLP::backwardSharded(const BasicTensor& x, std::size_t shards, const Shard
             weighted.backward();
             shardLosses[s] = weighted.value()[0];
             for (const auto& p : replicaParams) shardGrads[s].push_back(p.grad());
+            if (inputGrad)
+                std::copy(slice.grad().begin(), slice.grad().end(),
+                          inputGrads.begin() + std::ptrdiff_t(first*inputs));
         }
     });
 
-    // Step 2: each parameter element sums its shard gradients in shard order; one owner per element.
-    auto params = parameters();
+    // Step 2: nothing is accumulated until every shard has succeeded. Each parameter element
+    // sums its shard gradients in shard order, one owner per element; each input row came
+    // from exactly one shard.
+    if (inputGrad) BasicTensor(x).accumulateGrad(inputGrads);
     for (std::size_t p = 0; p < params.size(); ++p) {
         Values total(params[p].value().size());
         detail::parallelFor(pool, total.size(), shards, [&](std::size_t i) {
@@ -236,8 +309,9 @@ float MLP::backwardSharded(const BasicTensor& x, std::size_t shards, const Shard
 }
 
 void MLP::save(const std::filesystem::path& path) const {
-    // Stage on the same filesystem. Linking publishes only a complete file and
-    // fails atomically if another trainer already created the destination.
+    // Stage on the same filesystem. Linking publishes only a complete file and fails
+    // atomically if another trainer already created the destination (or a dangling
+    // symlink sits there).
     namespace fs = std::filesystem;
     fs::path staging;
     for (unsigned attempt = 0; ; ++attempt) {
@@ -277,15 +351,9 @@ void MLP::save(const std::filesystem::path& path) const {
         fs::create_hard_link(staged, path, linkError);
         if (linkError && !linksUnsupported(linkError))
             throw fs::filesystem_error("MLP::save: cannot publish checkpoint", staged, path, linkError);
-        if (linkError) {
-            // No hard links here. rename() still publishes only a complete file, but it
-            // replaces an existing one, so check first. A trainer that creates `path`
-            // between the check and the rename can be overwritten; only on such filesystems.
-            if (fs::exists(path))
-                throw fs::filesystem_error("MLP::save: checkpoint already exists", path,
-                                           std::make_error_code(std::errc::file_exists));
-            fs::rename(staged, path);
-        }
+        // No hard links here. A plain rename() would replace a checkpoint that another
+        // trainer published, so only an atomic no-replace rename will do.
+        if (linkError) renameNoReplace(staged, path);
     } catch (...) {
         std::error_code ignored;
         fs::remove_all(staging, ignored);
